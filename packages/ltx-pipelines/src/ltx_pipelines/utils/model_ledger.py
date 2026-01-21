@@ -51,10 +51,11 @@ class ModelLedger:
     :class:`~ltx_core.loader.registry.Registry` to load weights from the checkpoint,
     instantiates the model with the configured ``dtype``, and moves it to ``self.device``.
     .. note::
-        Models are **not cached**. Each call to a model method creates a new instance.
+        Models are **not cached** by default. Each call to a model method creates a new instance.
         Callers are responsible for storing references to models they wish to reuse
         and for freeing GPU memory (e.g. by deleting references and calling
         ``torch.cuda.empty_cache()``).
+        Use :meth:`cache_components` to preload and cache all models for faster subsequent calls.
     ### Constructor parameters
     dtype:
         Torch dtype used when constructing all models (e.g. ``torch.bfloat16``).
@@ -80,6 +81,9 @@ class ModelLedger:
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
     fp8transformer:
         If ``True``, builds the transformer with FP8 quantization and upcasting during inference.
+    tokenizer_max_length:
+        Optional maximum token length for the text encoder tokenizer. If provided,
+        overrides the default tokenizer max_length (useful for longer prompts).
     ### Creating Variants
     Use :meth:`with_loras` to create a new ``ModelLedger`` instance that includes
     additional LoRA configurations while sharing the same registry for weight caching.
@@ -95,6 +99,7 @@ class ModelLedger:
         loras: LoraPathStrengthAndSDOps | None = None,
         registry: Registry | None = None,
         fp8transformer: bool = False,
+        tokenizer_max_length: int | None = None,
     ):
         self.dtype = dtype
         self.device = device
@@ -104,6 +109,8 @@ class ModelLedger:
         self.loras = loras or ()
         self.registry = registry or DummyRegistry()
         self.fp8transformer = fp8transformer
+        self.tokenizer_max_length = tokenizer_max_length
+        self._cached_components: dict[str, object] = {}
         self.build_model_builders()
 
     def build_model_builders(self) -> None:
@@ -180,42 +187,148 @@ class ModelLedger:
             loras=(*self.loras, *loras),
             registry=self.registry,
             fp8transformer=self.fp8transformer,
+            tokenizer_max_length=self.tokenizer_max_length,
         )
 
-    def transformer(self) -> X0Model:
-        if not hasattr(self, "transformer_builder"):
-            raise ValueError(
-                "Transformer not initialized. Please provide a checkpoint path to the ModelLedger constructor."
-            )
+    def cache_components(
+        self,
+        text_encoder: bool = True,
+        video_encoder: bool = True,
+        transformer: bool = True,
+        video_decoder: bool = True,
+        audio_decoder: bool = True,
+        vocoder: bool = True,
+        spatial_upsampler: bool = True,
+    ) -> None:
+        """
+        Preload and cache model components for faster subsequent calls.
+
+        After calling this method, the corresponding model methods will return
+        cached instances instead of building new ones. This is useful for
+        serverless deployments where container startup time matters.
+
+        Args:
+            text_encoder: Cache the text encoder if available.
+            video_encoder: Cache the video encoder if available.
+            transformer: Cache the transformer if available.
+            video_decoder: Cache the video decoder if available.
+            audio_decoder: Cache the audio decoder if available.
+            vocoder: Cache the vocoder if available.
+            spatial_upsampler: Cache the spatial upsampler if available.
+        """
+        if text_encoder and hasattr(self, "text_encoder_builder"):
+            self._cached_components["text_encoder"] = self._build_text_encoder()
+
+        if video_encoder and hasattr(self, "vae_encoder_builder"):
+            self._cached_components["video_encoder"] = self._build_video_encoder()
+
+        if transformer and hasattr(self, "transformer_builder"):
+            self._cached_components["transformer"] = self._build_transformer()
+
+        if video_decoder and hasattr(self, "vae_decoder_builder"):
+            self._cached_components["video_decoder"] = self._build_video_decoder()
+
+        if audio_decoder and hasattr(self, "audio_decoder_builder"):
+            self._cached_components["audio_decoder"] = self._build_audio_decoder()
+
+        if vocoder and hasattr(self, "vocoder_builder"):
+            self._cached_components["vocoder"] = self._build_vocoder()
+
+        if spatial_upsampler and hasattr(self, "upsampler_builder"):
+            self._cached_components["spatial_upsampler"] = self._build_spatial_upsampler()
+
+    def clear_cache(self, component: str | None = None) -> None:
+        """
+        Clear cached components to free GPU memory.
+
+        Args:
+            component: Name of the component to clear. If None, clears all.
+        """
+        if component is None:
+            self._cached_components.clear()
+        elif component in self._cached_components:
+            del self._cached_components[component]
+
+    def _build_transformer(self) -> X0Model:
+        """Internal method to build a new transformer instance."""
         if self.fp8transformer:
             fp8_builder = replace(
                 self.transformer_builder,
                 module_ops=(UPCAST_DURING_INFERENCE,),
                 model_sd_ops=LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
             )
-            return X0Model(fp8_builder.build(device=self._target_device())).to(self.device).eval()
+            model = X0Model(fp8_builder.build(device=self._target_device())).to(self.device)
         else:
-            return (
-                X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))
-                .to(self.device)
-                .eval()
+            model = X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype)).to(
+                self.device
             )
+        model.eval()
+        return model
+
+    def _build_video_decoder(self) -> VideoDecoder:
+        """Internal method to build a new video decoder instance."""
+        model = self.vae_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        model.eval()
+        return model
+
+    def _build_video_encoder(self) -> VideoEncoder:
+        """Internal method to build a new video encoder instance."""
+        model = self.vae_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        model.eval()
+        return model
+
+    def _build_text_encoder(self) -> AVGemmaTextEncoderModel:
+        """Internal method to build a new text encoder instance."""
+        encoder = self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        encoder.eval()
+        if self.tokenizer_max_length is not None:
+            encoder.tokenizer.max_length = self.tokenizer_max_length
+        return encoder
+
+    def _build_audio_decoder(self) -> AudioDecoder:
+        """Internal method to build a new audio decoder instance."""
+        model = self.audio_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        model.eval()
+        return model
+
+    def _build_vocoder(self) -> Vocoder:
+        """Internal method to build a new vocoder instance."""
+        model = self.vocoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        model.eval()
+        return model
+
+    def _build_spatial_upsampler(self) -> LatentUpsampler:
+        """Internal method to build a new spatial upsampler instance."""
+        model = self.upsampler_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        model.eval()
+        return model
+
+    def transformer(self) -> X0Model:
+        if not hasattr(self, "transformer_builder"):
+            raise ValueError(
+                "Transformer not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+        if "transformer" in self._cached_components:
+            return self._cached_components["transformer"]
+        return self._build_transformer()
 
     def video_decoder(self) -> VideoDecoder:
         if not hasattr(self, "vae_decoder_builder"):
             raise ValueError(
                 "Video decoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
-
-        return self.vae_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        if "video_decoder" in self._cached_components:
+            return self._cached_components["video_decoder"]
+        return self._build_video_decoder()
 
     def video_encoder(self) -> VideoEncoder:
         if not hasattr(self, "vae_encoder_builder"):
             raise ValueError(
                 "Video encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
-
-        return self.vae_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        if "video_encoder" in self._cached_components:
+            return self._cached_components["video_encoder"]
+        return self._build_video_encoder()
 
     def text_encoder(self) -> AVGemmaTextEncoderModel:
         if not hasattr(self, "text_encoder_builder"):
@@ -223,27 +336,31 @@ class ModelLedger:
                 "Text encoder not initialized. Please provide a checkpoint path and gemma root path to the "
                 "ModelLedger constructor."
             )
-
-        return self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        if "text_encoder" in self._cached_components:
+            return self._cached_components["text_encoder"]
+        return self._build_text_encoder()
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):
             raise ValueError(
                 "Audio decoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
-
-        return self.audio_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        if "audio_decoder" in self._cached_components:
+            return self._cached_components["audio_decoder"]
+        return self._build_audio_decoder()
 
     def vocoder(self) -> Vocoder:
         if not hasattr(self, "vocoder_builder"):
             raise ValueError(
                 "Vocoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
             )
-
-        return self.vocoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        if "vocoder" in self._cached_components:
+            return self._cached_components["vocoder"]
+        return self._build_vocoder()
 
     def spatial_upsampler(self) -> LatentUpsampler:
         if not hasattr(self, "upsampler_builder"):
             raise ValueError("Upsampler not initialized. Please provide upsampler path to the ModelLedger constructor.")
-
-        return self.upsampler_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
+        if "spatial_upsampler" in self._cached_components:
+            return self._cached_components["spatial_upsampler"]
+        return self._build_spatial_upsampler()
