@@ -81,6 +81,8 @@ class DistilledPipeline:
         images: list[tuple[str, int, float]],
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
+        image_crf: float | None = None,
+        skip_cleanup: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -95,9 +97,10 @@ class DistilledPipeline:
         context_p = encode_text(text_encoder, prompts=[prompt])[0]
         video_context, audio_context = context_p
 
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del text_encoder
+            cleanup_memory()
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.model_ledger.video_encoder()
@@ -133,6 +136,7 @@ class DistilledPipeline:
             video_encoder=video_encoder,
             dtype=dtype,
             device=self.device,
+            image_crf=image_crf,
         )
 
         video_state, audio_state = denoise_audio_video(
@@ -152,8 +156,9 @@ class DistilledPipeline:
             latent=video_state.latent[:1], video_encoder=video_encoder, upsampler=self.model_ledger.spatial_upsampler()
         )
 
-        torch.cuda.synchronize()
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            cleanup_memory()
 
         stage_2_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
@@ -164,6 +169,7 @@ class DistilledPipeline:
             video_encoder=video_encoder,
             dtype=dtype,
             device=self.device,
+            image_crf=image_crf,
         )
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
@@ -180,10 +186,11 @@ class DistilledPipeline:
             initial_audio_latent=audio_state.latent,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        del video_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            del video_encoder
+            cleanup_memory()
 
         decoded_video = vae_decode_video(
             video_state.latent, self.model_ledger.video_decoder(), tiling_config, generator

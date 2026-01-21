@@ -76,6 +76,8 @@ class TI2VidOneStagePipeline:
         cfg_guidance_scale: float,
         images: list[tuple[str, int, float]],
         enhance_prompt: bool = False,
+        image_crf: float | None = None,
+        skip_cleanup: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=False)
 
@@ -94,9 +96,10 @@ class TI2VidOneStagePipeline:
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
 
-        torch.cuda.synchronize()
-        del text_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del text_encoder
+            cleanup_memory()
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.model_ledger.video_encoder()
@@ -129,6 +132,7 @@ class TI2VidOneStagePipeline:
             video_encoder=video_encoder,
             dtype=dtype,
             device=self.device,
+            image_crf=image_crf,
         )
 
         video_state, audio_state = denoise_audio_video(
@@ -143,9 +147,10 @@ class TI2VidOneStagePipeline:
             device=self.device,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         decoded_video = vae_decode_video(video_state.latent, self.model_ledger.video_decoder(), generator=generator)
         decoded_audio = vae_decode_audio(

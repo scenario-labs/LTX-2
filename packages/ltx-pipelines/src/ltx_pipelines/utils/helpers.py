@@ -45,6 +45,7 @@ def image_conditionings_by_replacing_latent(
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
+    image_crf: float | None = None,
 ) -> list[ConditioningItem]:
     conditionings = []
     for image_path, frame_idx, strength in images:
@@ -54,6 +55,7 @@ def image_conditionings_by_replacing_latent(
             width=width,
             dtype=dtype,
             device=device,
+            image_crf=image_crf,
         )
         encoded_image = video_encoder(image)
         conditionings.append(
@@ -74,6 +76,7 @@ def image_conditionings_by_adding_guiding_latent(
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
+    image_crf: float | None = None,
 ) -> list[ConditioningItem]:
     conditionings = []
     for image_path, frame_idx, strength in images:
@@ -83,6 +86,7 @@ def image_conditionings_by_adding_guiding_latent(
             width=width,
             dtype=dtype,
             device=device,
+            image_crf=image_crf,
         )
         encoded_image = video_encoder(image)
         conditionings.append(
