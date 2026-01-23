@@ -3,7 +3,6 @@ import triton
 
 from ltx_core.loader.kernels import fused_add_round_kernel
 from ltx_core.loader.primitives import LoraStateDictWithStrength, StateDict
-from typing import Iterable
 
 BLOCK_SIZE = 1024
 
@@ -60,58 +59,42 @@ def _prepare_deltas(
         return deltas[0]
     return torch.sum(torch.stack(deltas, dim=0), dim=0)
 
+
 def apply_loras(
     model_sd: StateDict,
     lora_sd_and_strengths: list[LoraStateDictWithStrength],
     dtype: torch.dtype,
     destination_sd: StateDict | None = None,
-    return_affected: bool = False,
-) -> StateDict | tuple[StateDict, list[str]]:
-    sd = destination_sd.sd if destination_sd is not None else {}
+) -> StateDict:
+    sd = {}
+    if destination_sd is not None:
+        sd = destination_sd.sd
     size = 0
     device = torch.device("meta")
     inner_dtypes = set()
-
-    affected_weight_keys: list[str] = []
-    affected_module_prefixes: set[str] = set()
-
     for key, weight in model_sd.sd.items():
         if weight is None:
             continue
-        if not key.endswith(".weight"):
-            # optional: skip non-weight tensors if your SD has them
-            continue
-
         device = weight.device
         target_dtype = dtype if dtype is not None else weight.dtype
-        deltas_dtype = target_dtype  # you said ignore fp8 path
-
+        deltas_dtype = target_dtype if target_dtype not in [torch.float8_e4m3fn, torch.float8_e5m2] else torch.bfloat16
         deltas = _prepare_deltas(lora_sd_and_strengths, key, deltas_dtype, device)
-
-        # Record which weights are actually modified by LoRA
-        if deltas is not None:
-            affected_weight_keys.append(key)
-            affected_module_prefixes.add(key[: -len(".weight")])
-
         if deltas is None:
             if key in sd:
                 continue
-            out = weight.clone().to(dtype=target_dtype, device=device)
+            deltas = weight.clone().to(dtype=target_dtype, device=device)
+        elif weight.dtype == torch.float8_e4m3fn:
+            if str(device).startswith("cuda"):
+                deltas = calculate_weight_float8_(deltas, weight)
+            else:
+                deltas.add_(weight.to(dtype=deltas.dtype, device=device))
+        elif weight.dtype == torch.bfloat16:
+            deltas.add_(weight)
         else:
-            # normal add_ path (bf16 etc)
-            out = deltas.to(dtype=target_dtype)
-            # IMPORTANT: add base weight
-            out.add_(weight.to(dtype=out.dtype, device=device))
-
-        sd[key] = out
+            raise ValueError(f"Unsupported dtype: {weight.dtype}")
+        sd[key] = deltas.to(dtype=target_dtype)
         inner_dtypes.add(target_dtype)
-        size += out.nbytes
-
-    result = destination_sd if destination_sd is not None else StateDict(sd, device, size, inner_dtypes)
-
-    if return_affected:
-        # sorted for stable output
-        affected = sorted(affected_module_prefixes)
-        return result, affected
-
-    return result
+        size += deltas.nbytes
+    if destination_sd is not None:
+        return destination_sd
+    return StateDict(sd, device, size, inner_dtypes)
