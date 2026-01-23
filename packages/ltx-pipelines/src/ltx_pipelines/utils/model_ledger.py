@@ -303,9 +303,8 @@ class ModelLedger:
 
         if not all_loras:
             # No LoRAs - restore to base weights
-            sd = base_sd.sd
             # X0Model wraps LTXModel via .velocity_model attribute
-            transformer.velocity_model.load_state_dict(sd, strict=False, assign=True)
+            transformer.velocity_model.load_state_dict(base_sd.sd, strict=False, assign=True)
             return
 
         # Load LoRA state dicts (cached in registry)
@@ -323,17 +322,12 @@ class ModelLedger:
             for sd, lora in zip(lora_state_dicts, all_loras, strict=True)
         ]
 
-        # Determine target dtype for fusion
-        target_dtype = None  # Keep original dtype from base_sd
-        if self.fp8transformer:
-            # FP8 transformer: apply_loras handles FP8 fusion via Triton kernel
-            pass
-
         # Fuse base weights with LoRAs
+        # Note: apply_loras() automatically handles FP8 weights via Triton kernel
         fused_sd = apply_loras(
             model_sd=base_sd,
             lora_sd_and_strengths=lora_sd_and_strengths,
-            dtype=target_dtype,
+            dtype=None,  # Keep original dtype from base_sd
         )
 
         # Update transformer weights in-place
