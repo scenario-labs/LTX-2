@@ -2,7 +2,8 @@ from dataclasses import replace
 
 import torch
 
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps
+from ltx_core.loader.fuse_loras import apply_loras
+from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, LoraStateDictWithStrength
 from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
@@ -242,6 +243,102 @@ class ModelLedger:
             self._cached_components.clear()
         elif component in self._cached_components:
             del self._cached_components[component]
+
+    def apply_loras_to_cached_transformer(
+        self,
+        additional_loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
+    ) -> None:
+        """
+        Apply LoRAs to the cached transformer in-place.
+
+        This method allows dynamic LoRA switching without rebuilding the entire
+        pipeline. It combines the ledger's built-in loras with additional_loras,
+        fuses them with the base model weights, and updates the cached transformer.
+
+        The base model state dict is loaded from the registry (cached), making
+        subsequent calls fast. LoRA state dicts are also cached in the registry.
+
+        Args:
+            additional_loras: Additional LoRAs to apply on top of built-in ones.
+                Pass empty tuple to restore to just the built-in loras.
+
+        Raises:
+            ValueError: If transformer is not cached or checkpoint_path not set.
+
+        Example:
+            # Setup: cache transformer with built-in loras (e.g., distilled_lora)
+            ledger.cache_components(transformer=True)
+
+            # Per-request: apply camera LoRA
+            camera_lora = LoraPathStrengthAndSDOps(path, strength, sd_ops)
+            ledger.apply_loras_to_cached_transformer((camera_lora,))
+
+            # Later: remove camera LoRA, restore to built-in only
+            ledger.apply_loras_to_cached_transformer(())
+        """
+        if "transformer" not in self._cached_components:
+            raise ValueError(
+                "Transformer must be cached first via cache_components(transformer=True)"
+            )
+        if not hasattr(self, "transformer_builder"):
+            raise ValueError(
+                "Transformer builder not initialized. Provide checkpoint_path to constructor."
+            )
+
+        transformer = self._cached_components["transformer"]
+        all_loras = (*self.loras, *additional_loras)
+
+        # Get base model state dict from registry (cached after first load)
+        model_paths = (
+            [self.checkpoint_path]
+            if isinstance(self.checkpoint_path, str)
+            else list(self.checkpoint_path)
+        )
+        base_sd = self.transformer_builder.load_sd(
+            model_paths,
+            sd_ops=self.transformer_builder.model_sd_ops,
+            registry=self.registry,
+            device=self._target_device(),
+        )
+
+        if not all_loras:
+            # No LoRAs - restore to base weights
+            sd = base_sd.sd
+            # X0Model wraps LTXModel via .velocity_model attribute
+            transformer.velocity_model.load_state_dict(sd, strict=False, assign=True)
+            return
+
+        # Load LoRA state dicts (cached in registry)
+        lora_state_dicts = [
+            self.transformer_builder.load_sd(
+                [lora.path],
+                sd_ops=lora.sd_ops,
+                registry=self.registry,
+                device=self._target_device(),
+            )
+            for lora in all_loras
+        ]
+        lora_sd_and_strengths = [
+            LoraStateDictWithStrength(sd, lora.strength)
+            for sd, lora in zip(lora_state_dicts, all_loras, strict=True)
+        ]
+
+        # Determine target dtype for fusion
+        target_dtype = None  # Keep original dtype from base_sd
+        if self.fp8transformer:
+            # FP8 transformer: apply_loras handles FP8 fusion via Triton kernel
+            pass
+
+        # Fuse base weights with LoRAs
+        fused_sd = apply_loras(
+            model_sd=base_sd,
+            lora_sd_and_strengths=lora_sd_and_strengths,
+            dtype=target_dtype,
+        )
+
+        # Update transformer weights in-place
+        # X0Model wraps LTXModel via .velocity_model attribute
+        transformer.velocity_model.load_state_dict(fused_sd.sd, strict=False, assign=True)
 
     def _build_transformer(self) -> X0Model:
         """Internal method to build a new transformer instance."""
