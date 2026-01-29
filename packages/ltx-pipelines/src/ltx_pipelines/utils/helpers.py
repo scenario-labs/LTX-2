@@ -137,21 +137,41 @@ def video_conditionings_by_replacing_latent(
     """
     from ltx_pipelines.utils.media_io import decode_video_from_file, normalize_latent, resize_and_center_crop
 
-    # VAE temporal compression factor
+    # VAE temporal compression: F' = 1 + (F-1)/8
+    # - Pixel 0 -> Latent 0 (first frame preserved)
+    # - Pixels 1-8 -> Latent 1
+    # - Pixels 9-16 -> Latent 2
+    # - Pixels (k-1)*8+1 to k*8 -> Latent k (for k >= 1)
+    #
+    # Since VAE is causal, the LAST pixel in each group most influences that latent.
+    # So we sample: pixel 0 for latent 0, pixel 8*k for latent k (capped at last frame).
     TEMPORAL_COMPRESSION = 8
 
     # Load all pixel frames from video
     frames = list(decode_video_from_file(path=video_path, frame_cap=100000, device=device))
+    num_pixel_frames = len(frames)
+    last_pixel = num_pixel_frames - 1
 
-    # Sample every 8th frame starting from the END to ensure last frame is included.
-    # This is important for video extension - the transition point must be captured.
-    # E.g., 150 frames -> indices [149, 141, 133, ...] -> reversed to [5, 13, ..., 141, 149]
-    sample_indices = list(range(len(frames) - 1, -1, -TEMPORAL_COMPRESSION))
-    sample_indices.reverse()  # Chronological order
+    # Calculate how many latent frames this video maps to
+    # pixel p -> latent 0 if p=0, else latent 1 + floor((p-1)/8)
+    if last_pixel == 0:
+        num_latent_frames = 1
+    else:
+        num_latent_frames = 1 + (last_pixel - 1) // TEMPORAL_COMPRESSION + 1
 
     # Apply max_frames limit (in latent frame count)
     if max_frames is not None:
-        sample_indices = sample_indices[:max_frames]
+        num_latent_frames = min(num_latent_frames, max_frames)
+
+    # Sample the last pixel of each temporal group for best latent representation
+    sample_indices = []
+    for latent_idx in range(num_latent_frames):
+        if latent_idx == 0:
+            sample_indices.append(0)  # First frame always at position 0
+        else:
+            # Last pixel of this latent's group, capped at actual last frame
+            pixel_idx = min(latent_idx * TEMPORAL_COMPRESSION, last_pixel)
+            sample_indices.append(pixel_idx)
 
     sampled_frames = [frames[i] for i in sample_indices]
 
