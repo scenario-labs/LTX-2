@@ -143,13 +143,17 @@ def video_conditionings_by_replacing_latent(
     # Load all pixel frames from video
     frames = list(decode_video_from_file(path=video_path, frame_cap=100000, device=device))
 
-    # Sample every TEMPORAL_COMPRESSION frames to match latent frame rate
-    # This gives us one pixel frame representative per latent frame
-    sampled_frames = frames[::TEMPORAL_COMPRESSION]
+    # Sample every 8th frame starting from the END to ensure last frame is included.
+    # This is important for video extension - the transition point must be captured.
+    # E.g., 150 frames -> indices [149, 141, 133, ...] -> reversed to [5, 13, ..., 141, 149]
+    sample_indices = list(range(len(frames) - 1, -1, -TEMPORAL_COMPRESSION))
+    sample_indices.reverse()  # Chronological order
 
     # Apply max_frames limit (in latent frame count)
     if max_frames is not None:
-        sampled_frames = sampled_frames[:max_frames]
+        sample_indices = sample_indices[:max_frames]
+
+    sampled_frames = [frames[i] for i in sample_indices]
 
     conditionings = []
     for latent_idx, frame in enumerate(sampled_frames):
