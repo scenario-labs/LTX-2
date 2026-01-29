@@ -102,6 +102,61 @@ def image_conditionings_by_adding_guiding_latent(
     return conditionings
 
 
+def video_conditionings_by_replacing_latent(
+    video_path: str,
+    height: int,
+    width: int,
+    video_encoder: VideoEncoder,
+    dtype: torch.dtype,
+    device: torch.device,
+    strength: float = 1.0,
+    start_frame_idx: int = 0,
+    max_frames: int | None = None,
+) -> list[ConditioningItem]:
+    """Create conditionings that REPLACE latent frames with encoded video frames.
+
+    This is used for video extension: the input video frames are frozen in place
+    (with strength=1.0) and the model generates continuation frames after them.
+
+    Args:
+        video_path: Path to the input video file.
+        height: Target height for conditioning frames.
+        width: Target width for conditioning frames.
+        video_encoder: Video encoder for converting frames to latents.
+        dtype: Data type for tensors.
+        device: Device for tensors.
+        strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
+        start_frame_idx: Starting latent frame index for the first video frame.
+        max_frames: Maximum number of frames to load from video (None = all frames).
+
+    Returns:
+        List of VideoConditionByLatentIndex items, one per video frame.
+    """
+    from ltx_pipelines.utils.media_io import decode_video_from_file, normalize_latent, resize_and_center_crop
+
+    frames = list(decode_video_from_file(path=video_path, frame_cap=max_frames, device=device))
+
+    conditionings = []
+    for i, frame in enumerate(frames):
+        # Resize and normalize each frame
+        frame_tensor = resize_and_center_crop(frame.to(torch.float32), height, width)
+        frame_tensor = normalize_latent(frame_tensor, device, dtype)
+
+        # Encode frame to latent
+        encoded_frame = video_encoder(frame_tensor)
+
+        # Create conditioning that replaces this frame position
+        conditionings.append(
+            VideoConditionByLatentIndex(
+                latent=encoded_frame,
+                strength=strength,
+                latent_idx=start_frame_idx + i,
+            )
+        )
+
+    return conditionings
+
+
 def euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState,
