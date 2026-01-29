@@ -113,13 +113,14 @@ def video_conditionings_by_replacing_latent(
     start_frame_idx: int = 0,
     max_frames: int | None = None,
 ) -> list[ConditioningItem]:
-    """Create conditionings that REPLACE latent frames with encoded video frames.
+    """Create conditioning that REPLACES latent frames with encoded video.
 
     This is used for video extension: the input video frames are frozen in place
     (with strength=1.0) and the model generates continuation frames after them.
 
-    The VAE compresses temporally by 8x, so we sample every 8th pixel frame
-    to create one conditioning per latent frame position.
+    The entire video is encoded at once (preserving temporal context) and placed
+    at latent_idx=0. The VAE requires 1+8k frames, so we truncate to the nearest
+    valid frame count.
 
     Args:
         video_path: Path to the input video file.
@@ -129,71 +130,43 @@ def video_conditionings_by_replacing_latent(
         dtype: Data type for tensors.
         device: Device for tensors.
         strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
-        start_frame_idx: Starting latent frame index for the first video frame.
-        max_frames: Maximum number of LATENT frames to use (None = all latent frames).
+        start_frame_idx: Starting latent frame index (usually 0).
+        max_frames: Maximum number of pixel frames to use (None = all frames).
 
     Returns:
-        List of VideoConditionByLatentIndex items, one per latent frame.
+        List with single VideoConditionByLatentIndex for the entire video.
     """
-    from ltx_pipelines.utils.media_io import decode_video_from_file, normalize_latent, resize_and_center_crop
+    from ltx_pipelines.utils.media_io import load_video_conditioning
 
-    # VAE temporal compression: F' = 1 + (F-1)/8
-    # - Pixel 0 -> Latent 0 (first frame preserved)
-    # - Pixels 1-8 -> Latent 1
-    # - Pixels 9-16 -> Latent 2
-    # - Pixels (k-1)*8+1 to k*8 -> Latent k (for k >= 1)
-    #
-    # Since VAE is causal, the LAST pixel in each group most influences that latent.
-    # So we sample: pixel 0 for latent 0, pixel 8*k for latent k (capped at last frame).
-    TEMPORAL_COMPRESSION = 8
+    # VAE requires 1 + 8k frames. Truncate to nearest valid count.
+    # Load video and truncate to valid frame count
+    frame_cap = max_frames if max_frames is not None else 100000
+    video = load_video_conditioning(
+        video_path=video_path,
+        height=height,
+        width=width,
+        frame_cap=frame_cap,
+        dtype=dtype,
+        device=device,
+    )
 
-    # Load all pixel frames from video
-    frames = list(decode_video_from_file(path=video_path, frame_cap=100000, device=device))
-    num_pixel_frames = len(frames)
-    last_pixel = num_pixel_frames - 1
+    # Truncate to valid 1 + 8k frame count
+    num_frames = video.shape[2]
+    valid_frames = ((num_frames - 1) // 8) * 8 + 1
+    if valid_frames < num_frames:
+        video = video[:, :, :valid_frames, :, :]
 
-    # Calculate how many latent frames this video maps to
-    # pixel p -> latent 0 if p=0, else latent 1 + floor((p-1)/8)
-    if last_pixel == 0:
-        num_latent_frames = 1
-    else:
-        num_latent_frames = 1 + (last_pixel - 1) // TEMPORAL_COMPRESSION + 1
+    # Encode entire video at once (proper temporal context)
+    encoded_video = video_encoder(video)
 
-    # Apply max_frames limit (in latent frame count)
-    if max_frames is not None:
-        num_latent_frames = min(num_latent_frames, max_frames)
-
-    # Sample the last pixel of each temporal group for best latent representation
-    sample_indices = []
-    for latent_idx in range(num_latent_frames):
-        if latent_idx == 0:
-            sample_indices.append(0)  # First frame always at position 0
-        else:
-            # Last pixel of this latent's group, capped at actual last frame
-            pixel_idx = min(latent_idx * TEMPORAL_COMPRESSION, last_pixel)
-            sample_indices.append(pixel_idx)
-
-    sampled_frames = [frames[i] for i in sample_indices]
-
-    conditionings = []
-    for latent_idx, frame in enumerate(sampled_frames):
-        # Resize and normalize each frame
-        frame_tensor = resize_and_center_crop(frame.to(torch.float32), height, width)
-        frame_tensor = normalize_latent(frame_tensor, device, dtype)
-
-        # Encode frame to latent
-        encoded_frame = video_encoder(frame_tensor)
-
-        # Create conditioning that replaces this latent frame position
-        conditionings.append(
-            VideoConditionByLatentIndex(
-                latent=encoded_frame,
-                strength=strength,
-                latent_idx=start_frame_idx + latent_idx,
-            )
+    # Single conditioning that replaces all input frames
+    return [
+        VideoConditionByLatentIndex(
+            latent=encoded_video,
+            strength=strength,
+            latent_idx=start_frame_idx,
         )
-
-    return conditionings
+    ]
 
 
 def euler_denoising_loop(
