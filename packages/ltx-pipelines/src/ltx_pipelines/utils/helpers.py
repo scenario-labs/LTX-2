@@ -134,7 +134,9 @@ def video_conditionings_by_replacing_latent(
     """
     from ltx_pipelines.utils.media_io import decode_video_from_file, normalize_latent, resize_and_center_crop
 
-    frames = list(decode_video_from_file(path=video_path, frame_cap=max_frames, device=device))
+    # Use a large number if max_frames is None (decode_video_from_file requires int)
+    frame_cap = max_frames if max_frames is not None else 100000
+    frames = list(decode_video_from_file(path=video_path, frame_cap=frame_cap, device=device))
 
     conditionings = []
     for i, frame in enumerate(frames):
