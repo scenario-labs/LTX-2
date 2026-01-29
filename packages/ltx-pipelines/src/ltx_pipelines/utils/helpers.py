@@ -118,6 +118,9 @@ def video_conditionings_by_replacing_latent(
     This is used for video extension: the input video frames are frozen in place
     (with strength=1.0) and the model generates continuation frames after them.
 
+    The VAE compresses temporally by 8x, so we sample every 8th pixel frame
+    to create one conditioning per latent frame position.
+
     Args:
         video_path: Path to the input video file.
         height: Target height for conditioning frames.
@@ -127,19 +130,29 @@ def video_conditionings_by_replacing_latent(
         device: Device for tensors.
         strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
         start_frame_idx: Starting latent frame index for the first video frame.
-        max_frames: Maximum number of frames to load from video (None = all frames).
+        max_frames: Maximum number of LATENT frames to use (None = all latent frames).
 
     Returns:
-        List of VideoConditionByLatentIndex items, one per video frame.
+        List of VideoConditionByLatentIndex items, one per latent frame.
     """
     from ltx_pipelines.utils.media_io import decode_video_from_file, normalize_latent, resize_and_center_crop
 
-    # Use a large number if max_frames is None (decode_video_from_file requires int)
-    frame_cap = max_frames if max_frames is not None else 100000
-    frames = list(decode_video_from_file(path=video_path, frame_cap=frame_cap, device=device))
+    # VAE temporal compression factor
+    TEMPORAL_COMPRESSION = 8
+
+    # Load all pixel frames from video
+    frames = list(decode_video_from_file(path=video_path, frame_cap=100000, device=device))
+
+    # Sample every TEMPORAL_COMPRESSION frames to match latent frame rate
+    # This gives us one pixel frame representative per latent frame
+    sampled_frames = frames[::TEMPORAL_COMPRESSION]
+
+    # Apply max_frames limit (in latent frame count)
+    if max_frames is not None:
+        sampled_frames = sampled_frames[:max_frames]
 
     conditionings = []
-    for i, frame in enumerate(frames):
+    for latent_idx, frame in enumerate(sampled_frames):
         # Resize and normalize each frame
         frame_tensor = resize_and_center_crop(frame.to(torch.float32), height, width)
         frame_tensor = normalize_latent(frame_tensor, device, dtype)
@@ -147,12 +160,12 @@ def video_conditionings_by_replacing_latent(
         # Encode frame to latent
         encoded_frame = video_encoder(frame_tensor)
 
-        # Create conditioning that replaces this frame position
+        # Create conditioning that replaces this latent frame position
         conditionings.append(
             VideoConditionByLatentIndex(
                 latent=encoded_frame,
                 strength=strength,
-                latent_idx=start_frame_idx + i,
+                latent_idx=start_frame_idx + latent_idx,
             )
         )
 
