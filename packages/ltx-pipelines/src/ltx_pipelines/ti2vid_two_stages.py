@@ -23,7 +23,6 @@ from ltx_pipelines.utils.constants import (
 )
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
-    audio_conditionings_by_replacing_latent,
     cleanup_memory,
     denoise_audio_video,
     euler_denoising_loop,
@@ -34,10 +33,84 @@ from ltx_pipelines.utils.helpers import (
     simple_denoising_func,
     video_conditionings_by_replacing_latent,
 )
-from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
+
+
+def blend_audio_with_crossfade(
+    input_audio: torch.Tensor,
+    generated_audio: torch.Tensor,
+    input_duration_samples: int,
+    crossfade_samples: int,
+    sample_rate: int,
+) -> torch.Tensor:
+    """Blend input audio with generated audio using crossfade at the transition point.
+
+    Args:
+        input_audio: Audio from input video, shape (samples,) or (channels, samples).
+        generated_audio: Generated audio for full duration, same shape convention.
+        input_duration_samples: Number of samples from input video duration.
+        crossfade_samples: Number of samples for crossfade region.
+        sample_rate: Audio sample rate (for logging).
+
+    Returns:
+        Blended audio tensor with input audio preserved and crossfade to generated.
+    """
+    # Ensure both are 1D (mono) for simplicity - handle stereo if needed
+    if input_audio.ndim == 2:
+        input_audio = input_audio.mean(dim=0)  # Convert to mono
+    if generated_audio.ndim == 2:
+        generated_audio = generated_audio.mean(dim=0)  # Convert to mono
+
+    total_samples = generated_audio.shape[0]
+
+    # If input is longer than output, just use generated
+    if input_duration_samples >= total_samples:
+        return generated_audio
+
+    # Create output tensor
+    output = torch.zeros_like(generated_audio)
+
+    # Ensure crossfade doesn't exceed available samples
+    crossfade_start = max(0, input_duration_samples - crossfade_samples)
+    crossfade_end = min(input_duration_samples + crossfade_samples, total_samples)
+    actual_crossfade = crossfade_end - crossfade_start
+
+    # Copy input audio up to crossfade start
+    input_samples_available = min(input_audio.shape[0], crossfade_start)
+    output[:input_samples_available] = input_audio[:input_samples_available]
+
+    # Apply crossfade in the transition region
+    if actual_crossfade > 0:
+        # Create crossfade weights
+        fade_out = torch.linspace(1.0, 0.0, actual_crossfade, device=generated_audio.device)
+        fade_in = torch.linspace(0.0, 1.0, actual_crossfade, device=generated_audio.device)
+
+        # Get the audio segments for crossfade
+        input_fade_start = min(crossfade_start, input_audio.shape[0])
+        input_fade_end = min(crossfade_end, input_audio.shape[0])
+        input_fade_len = input_fade_end - input_fade_start
+
+        if input_fade_len > 0:
+            # Pad input audio if needed
+            input_crossfade_segment = torch.zeros(actual_crossfade, device=generated_audio.device)
+            input_crossfade_segment[:input_fade_len] = input_audio[input_fade_start:input_fade_end]
+        else:
+            input_crossfade_segment = torch.zeros(actual_crossfade, device=generated_audio.device)
+
+        gen_crossfade_segment = generated_audio[crossfade_start:crossfade_end]
+
+        # Blend
+        output[crossfade_start:crossfade_end] = (
+            input_crossfade_segment * fade_out + gen_crossfade_segment * fade_in
+        )
+
+    # Copy generated audio after crossfade
+    output[crossfade_end:] = generated_audio[crossfade_end:]
+
+    return output
 
 
 class TI2VidTwoStagesPipeline:
@@ -99,8 +172,25 @@ class TI2VidTwoStagesPipeline:
         skip_cleanup: bool = False,
         video_extend_path: str | None = None,
         video_extend_strength: float = 1.0,
+        audio_extend_mode: str = "generate",
+        audio_crossfade_duration: float = 0.5,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
+
+        # Extract input audio for blending if requested
+        input_audio = None
+        input_video_frames = 0
+        if video_extend_path and audio_extend_mode == "blend":
+            input_audio = decode_audio_from_file(video_extend_path, device=self.device)
+            # Count input video frames to determine blend point
+            import av
+            with av.open(video_extend_path) as container:
+                video_stream = next(s for s in container.streams if s.type == "video")
+                input_video_frames = video_stream.frames or 0
+                # If frames count unavailable, estimate from duration
+                if input_video_frames == 0 and video_stream.duration and video_stream.time_base:
+                    duration_sec = float(video_stream.duration * video_stream.time_base)
+                    input_video_frames = int(duration_sec * frame_rate)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -166,8 +256,7 @@ class TI2VidTwoStagesPipeline:
             image_crf=image_crf,
         )
 
-        # Add video and audio extension conditioning if provided
-        stage_1_audio_conditionings: list = []
+        # Add video extension conditioning if provided
         if video_extend_path:
             video_conds = video_conditionings_by_replacing_latent(
                 video_path=video_extend_path,
@@ -182,18 +271,6 @@ class TI2VidTwoStagesPipeline:
             )
             stage_1_conditionings.extend(video_conds)
 
-            # Create audio conditioning from input video's audio track
-            audio_encoder = self.stage_1_model_ledger.audio_encoder()
-            audio_conds = audio_conditionings_by_replacing_latent(
-                audio_path=video_extend_path,
-                audio_encoder=audio_encoder,
-                dtype=dtype,
-                device=self.device,
-                strength=video_extend_strength,
-                start_frame_idx=0,
-            )
-            stage_1_audio_conditionings.extend(audio_conds)
-
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -204,7 +281,6 @@ class TI2VidTwoStagesPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
-            audio_conditionings=stage_1_audio_conditionings if stage_1_audio_conditionings else None,
         )
 
         if not skip_cleanup:
@@ -252,8 +328,7 @@ class TI2VidTwoStagesPipeline:
             image_crf=image_crf,
         )
 
-        # Add video and audio extension conditioning for stage 2 as well
-        stage_2_audio_conditionings: list = []
+        # Add video extension conditioning for stage 2 as well
         if video_extend_path:
             video_conds = video_conditionings_by_replacing_latent(
                 video_path=video_extend_path,
@@ -268,19 +343,6 @@ class TI2VidTwoStagesPipeline:
             )
             stage_2_conditionings.extend(video_conds)
 
-            # Reuse audio encoder from stage 1 (still loaded)
-            # Audio conditioning is resolution-independent
-            audio_encoder = self.stage_1_model_ledger.audio_encoder()
-            audio_conds = audio_conditionings_by_replacing_latent(
-                audio_path=video_extend_path,
-                audio_encoder=audio_encoder,
-                dtype=dtype,
-                device=self.device,
-                strength=video_extend_strength,
-                start_frame_idx=0,
-            )
-            stage_2_audio_conditionings.extend(audio_conds)
-
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -294,7 +356,6 @@ class TI2VidTwoStagesPipeline:
             noise_scale=distilled_sigmas[0],
             initial_video_latent=upscaled_video_latent,
             initial_audio_latent=audio_state.latent,
-            audio_conditionings=stage_2_audio_conditionings if stage_2_audio_conditionings else None,
         )
 
         if not skip_cleanup:
@@ -309,6 +370,21 @@ class TI2VidTwoStagesPipeline:
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
+
+        # Blend input audio with generated audio if requested
+        if input_audio is not None and audio_extend_mode == "blend":
+            # Calculate blend point based on input video duration
+            input_duration_sec = float(input_video_frames) / float(frame_rate)
+            input_duration_samples = int(input_duration_sec * AUDIO_SAMPLE_RATE)
+            crossfade_samples = int(audio_crossfade_duration * AUDIO_SAMPLE_RATE)
+
+            decoded_audio = blend_audio_with_crossfade(
+                input_audio=input_audio,
+                generated_audio=decoded_audio,
+                input_duration_samples=input_duration_samples,
+                crossfade_samples=crossfade_samples,
+                sample_rate=AUDIO_SAMPLE_RATE,
+            )
 
         return decoded_video, decoded_audio
 
