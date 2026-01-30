@@ -2,19 +2,21 @@ import logging
 from collections.abc import Iterator
 
 import torch
+import torchaudio
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning.types import AudioConditionByLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
 from ltx_core.text_encoders.gemma import encode_text
-from ltx_core.types import LatentState, VideoPixelShape
+from ltx_core.types import AudioLatentShape, LatentState, VideoPixelShape
 from ltx_pipelines.utils import ModelLedger
 from ltx_pipelines.utils.args import default_2_stage_arg_parser
 from ltx_pipelines.utils.constants import (
@@ -33,102 +35,10 @@ from ltx_pipelines.utils.helpers import (
     simple_denoising_func,
     video_conditionings_by_replacing_latent,
 )
-from ltx_pipelines.utils.media_io import decode_audio_from_file, encode_video
+from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
-
-
-def blend_audio_with_crossfade(
-    input_audio: torch.Tensor,
-    generated_audio: torch.Tensor,
-    input_duration_samples: int,
-    crossfade_samples: int,
-    sample_rate: int,
-) -> torch.Tensor:
-    """Blend input audio with generated audio using crossfade at the transition point.
-
-    Note: This is post-processing blending, not true audio conditioning.
-    The generated audio is created independently, then blended with input audio.
-
-    Args:
-        input_audio: Audio from input video. Can be:
-            - Shape (frames, channels, samples_per_frame) from decode_audio_from_file
-            - Shape (samples,) flat mono
-            - Shape (channels, samples) stereo
-        generated_audio: Generated audio, typically shape (samples,) mono.
-        input_duration_samples: Number of samples from input video duration.
-        crossfade_samples: Number of samples for crossfade region.
-        sample_rate: Audio sample rate.
-
-    Returns:
-        Blended audio tensor with input audio preserved and crossfade to generated.
-    """
-    # Flatten input audio from decode_audio_from_file format [frames, channels, samples_per_frame]
-    if input_audio.ndim == 3:
-        # Shape: [frames, channels, samples_per_frame] -> [channels, total_samples]
-        frames, channels, samples_per_frame = input_audio.shape
-        input_audio = input_audio.permute(1, 0, 2).reshape(channels, -1)
-        # Convert to mono by averaging channels
-        input_audio = input_audio.mean(dim=0)
-    elif input_audio.ndim == 2:
-        # Shape: [channels, samples] -> mono
-        input_audio = input_audio.mean(dim=0)
-    # else: already 1D mono
-
-    # Ensure generated audio is also 1D
-    if generated_audio.ndim == 2:
-        generated_audio = generated_audio.mean(dim=0)
-
-    total_samples = generated_audio.shape[0]
-    input_total_samples = input_audio.shape[0]
-
-    # If input is longer than output, just use generated
-    if input_duration_samples >= total_samples:
-        return generated_audio
-
-    # Create output tensor
-    output = torch.zeros_like(generated_audio)
-
-    # Ensure crossfade doesn't exceed available samples
-    crossfade_start = max(0, input_duration_samples - crossfade_samples)
-    crossfade_end = min(input_duration_samples + crossfade_samples, total_samples)
-    actual_crossfade = crossfade_end - crossfade_start
-
-    # Copy input audio up to crossfade start
-    input_samples_available = min(input_total_samples, crossfade_start)
-    if input_samples_available > 0:
-        output[:input_samples_available] = input_audio[:input_samples_available]
-
-    # Apply crossfade in the transition region
-    if actual_crossfade > 0:
-        # Create crossfade weights
-        fade_out = torch.linspace(1.0, 0.0, actual_crossfade, device=generated_audio.device)
-        fade_in = torch.linspace(0.0, 1.0, actual_crossfade, device=generated_audio.device)
-
-        # Get the audio segments for crossfade
-        input_fade_start = min(crossfade_start, input_total_samples)
-        input_fade_end = min(crossfade_end, input_total_samples)
-        input_fade_len = input_fade_end - input_fade_start
-
-        if input_fade_len > 0:
-            # Pad input audio if needed
-            input_crossfade_segment = torch.zeros(actual_crossfade, device=generated_audio.device)
-            input_crossfade_segment[:input_fade_len] = input_audio[input_fade_start:input_fade_end]
-        else:
-            input_crossfade_segment = torch.zeros(actual_crossfade, device=generated_audio.device)
-
-        gen_crossfade_segment = generated_audio[crossfade_start:crossfade_end]
-
-        # Blend
-        output[crossfade_start:crossfade_end] = (
-            input_crossfade_segment * fade_out + gen_crossfade_segment * fade_in
-        )
-
-    # Copy generated audio after crossfade
-    output[crossfade_end:] = generated_audio[crossfade_end:]
-
-    return output
 
 
 class TI2VidTwoStagesPipeline:
@@ -170,6 +80,115 @@ class TI2VidTwoStagesPipeline:
             device=device,
         )
 
+    def _build_audio_conditionings_from_waveform(
+        self,
+        input_waveform: torch.Tensor,
+        input_sample_rate: int,
+        num_frames: int,
+        fps: float,
+        strength: float,
+    ) -> list[AudioConditionByLatent] | None:
+        """Convert input waveform to audio conditioning for the diffusion process.
+
+        Args:
+            input_waveform: Audio waveform tensor, shape (samples,), (C, samples), or (B, C, samples).
+            input_sample_rate: Sample rate of input waveform.
+            num_frames: Number of video frames (for duration alignment).
+            fps: Video frame rate.
+            strength: Conditioning strength (0-1). 1.0 = fully preserve input audio.
+
+        Returns:
+            List containing AudioConditionByLatent, or None if strength <= 0.
+        """
+        strength = float(strength)
+        if strength <= 0.0:
+            return None
+
+        # Normalize waveform shape to (B, C, T)
+        waveform = input_waveform
+        if waveform.ndim == 1:
+            waveform = waveform.unsqueeze(0).unsqueeze(0)  # (T,) -> (1, 1, T)
+        elif waveform.ndim == 2:
+            waveform = waveform.unsqueeze(0)  # (C, T) -> (1, C, T)
+        elif waveform.ndim != 3:
+            raise ValueError(f"input_waveform must be 1D/2D/3D, got shape {tuple(waveform.shape)}")
+
+        # Get audio encoder and extract config
+        audio_encoder = self.stage_1_model_ledger.audio_encoder()
+        target_sr = int(getattr(audio_encoder, "sample_rate", 16000))
+        target_channels = int(getattr(audio_encoder, "in_channels", 1))
+        mel_bins = int(getattr(audio_encoder, "mel_bins", 64))
+        mel_hop = int(getattr(audio_encoder, "mel_hop_length", 160))
+        n_fft = int(getattr(audio_encoder, "n_fft", 1024))
+
+        # Match channels
+        if waveform.shape[1] != target_channels:
+            if waveform.shape[1] == 1 and target_channels > 1:
+                waveform = waveform.repeat(1, target_channels, 1)
+            elif target_channels == 1:
+                waveform = waveform.mean(dim=1, keepdim=True)
+            else:
+                waveform = waveform[:, :target_channels, :]
+
+        # Resample to target sample rate
+        waveform = waveform.to(device="cpu", dtype=torch.float32)
+        if int(input_sample_rate) != target_sr:
+            waveform = torchaudio.functional.resample(waveform, int(input_sample_rate), target_sr)
+
+        # Waveform -> Mel spectrogram
+        audio_processor = AudioProcessor(
+            sample_rate=target_sr,
+            mel_bins=mel_bins,
+            mel_hop_length=mel_hop,
+            n_fft=n_fft,
+        ).to(waveform.device)
+        mel = audio_processor.waveform_to_mel(waveform, target_sr)
+
+        # Mel -> Audio latent via encoder
+        audio_params = next(audio_encoder.parameters(), None)
+        enc_device = audio_params.device if audio_params is not None else self.device
+        enc_dtype = audio_params.dtype if audio_params is not None else self.dtype
+
+        mel = mel.to(device=enc_device, dtype=enc_dtype)
+        with torch.inference_mode():
+            audio_latent = audio_encoder(mel)
+
+        # Align latent duration to video frames
+        audio_downsample = getattr(
+            getattr(audio_encoder, "patchifier", None), "audio_latent_downsample_factor", 4
+        )
+        target_shape = AudioLatentShape.from_video_pixel_shape(
+            VideoPixelShape(
+                batch=audio_latent.shape[0],
+                frames=int(num_frames),
+                width=1,
+                height=1,
+                fps=float(fps),
+            ),
+            channels=audio_latent.shape[1],
+            mel_bins=audio_latent.shape[3],
+            sample_rate=target_sr,
+            hop_length=mel_hop,
+            audio_latent_downsample_factor=audio_downsample,
+        )
+        target_frames = int(target_shape.frames)
+
+        # Pad or trim to match video duration
+        if audio_latent.shape[2] < target_frames:
+            pad_frames = target_frames - audio_latent.shape[2]
+            pad = torch.zeros(
+                (audio_latent.shape[0], audio_latent.shape[1], pad_frames, audio_latent.shape[3]),
+                device=audio_latent.device,
+                dtype=audio_latent.dtype,
+            )
+            audio_latent = torch.cat([audio_latent, pad], dim=2)
+        elif audio_latent.shape[2] > target_frames:
+            audio_latent = audio_latent[:, :, :target_frames, :]
+
+        # Return conditioning
+        audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
+        return [AudioConditionByLatent(audio_latent, strength)]
+
     @torch.inference_mode()
     def __call__(  # noqa: PLR0913
         self,
@@ -190,25 +209,24 @@ class TI2VidTwoStagesPipeline:
         skip_cleanup: bool = False,
         video_extend_path: str | None = None,
         video_extend_strength: float = 1.0,
-        audio_extend_mode: str = "generate",
-        audio_crossfade_duration: float = 0.5,
+        input_waveform: torch.Tensor | None = None,
+        input_waveform_sample_rate: int | None = None,
+        audio_strength: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
-        # Extract input audio for blending if requested
-        input_audio = None
-        input_video_frames = 0
-        if video_extend_path and audio_extend_mode == "blend":
-            input_audio = decode_audio_from_file(video_extend_path, device=self.device)
-            # Count input video frames to determine blend point
-            import av
-            with av.open(video_extend_path) as container:
-                video_stream = next(s for s in container.streams if s.type == "video")
-                input_video_frames = video_stream.frames or 0
-                # If frames count unavailable, estimate from duration
-                if input_video_frames == 0 and video_stream.duration and video_stream.time_base:
-                    duration_sec = float(video_stream.duration * video_stream.time_base)
-                    input_video_frames = int(duration_sec * frame_rate)
+        # Build audio conditionings from input waveform if provided
+        audio_conditionings = None
+        if input_waveform is not None:
+            if input_waveform_sample_rate is None:
+                raise ValueError("input_waveform_sample_rate must be provided when input_waveform is set.")
+            audio_conditionings = self._build_audio_conditionings_from_waveform(
+                input_waveform=input_waveform,
+                input_sample_rate=input_waveform_sample_rate,
+                num_frames=num_frames,
+                fps=frame_rate,
+                strength=audio_strength,
+            )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -299,6 +317,7 @@ class TI2VidTwoStagesPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
+            audio_conditionings=audio_conditionings,
         )
 
         if not skip_cleanup:
@@ -374,6 +393,7 @@ class TI2VidTwoStagesPipeline:
             noise_scale=distilled_sigmas[0],
             initial_video_latent=upscaled_video_latent,
             initial_audio_latent=audio_state.latent,
+            audio_conditionings=audio_conditionings,
         )
 
         if not skip_cleanup:
@@ -388,21 +408,6 @@ class TI2VidTwoStagesPipeline:
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
-
-        # Blend input audio with generated audio if requested
-        if input_audio is not None and audio_extend_mode == "blend":
-            # Calculate blend point based on input video duration
-            input_duration_sec = float(input_video_frames) / float(frame_rate)
-            input_duration_samples = int(input_duration_sec * AUDIO_SAMPLE_RATE)
-            crossfade_samples = int(audio_crossfade_duration * AUDIO_SAMPLE_RATE)
-
-            decoded_audio = blend_audio_with_crossfade(
-                input_audio=input_audio,
-                generated_audio=decoded_audio,
-                input_duration_samples=input_duration_samples,
-                crossfade_samples=crossfade_samples,
-                sample_rate=AUDIO_SAMPLE_RATE,
-            )
 
         return decoded_video, decoded_audio
 
