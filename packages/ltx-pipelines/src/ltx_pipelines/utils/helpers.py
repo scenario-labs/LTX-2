@@ -220,20 +220,24 @@ def audio_conditionings_by_replacing_latent(
         audio_waveform = audio_waveform.unsqueeze(0)
 
     # Convert to mel spectrogram
+    # Note: cuFFT doesn't support bfloat16, so we use float32 for the transform
+    # and convert to target dtype afterward
     audio_processor = AudioProcessor(
         sample_rate=sample_rate,
         mel_bins=mel_bins,
         mel_hop_length=mel_hop_length,
         n_fft=n_fft,
-    ).to(device=device, dtype=dtype)
+    ).to(device=device, dtype=torch.float32)
 
     # Note: decode_audio_from_file returns audio at original sample rate
     # AudioProcessor will resample if needed
     # Assume input is already at target sample rate for simplicity
     mel_spectrogram = audio_processor.waveform_to_mel(
-        waveform=audio_waveform.to(dtype),
+        waveform=audio_waveform.to(torch.float32),
         waveform_sample_rate=sample_rate,
     )
+    # Convert to target dtype after FFT
+    mel_spectrogram = mel_spectrogram.to(dtype)
 
     # Encode spectrogram to latents
     encoded_audio = audio_encoder(mel_spectrogram)
