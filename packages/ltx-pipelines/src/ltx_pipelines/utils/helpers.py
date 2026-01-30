@@ -102,6 +102,73 @@ def image_conditionings_by_adding_guiding_latent(
     return conditionings
 
 
+def video_conditionings_by_replacing_latent(
+    video_path: str,
+    height: int,
+    width: int,
+    video_encoder: VideoEncoder,
+    dtype: torch.dtype,
+    device: torch.device,
+    strength: float = 1.0,
+    start_frame_idx: int = 0,
+    max_frames: int | None = None,
+) -> list[ConditioningItem]:
+    """Create conditioning that REPLACES latent frames with encoded video.
+
+    This is used for video extension: the input video frames are frozen in place
+    (with strength=1.0) and the model generates continuation frames after them.
+
+    The entire video is encoded at once (preserving temporal context) and placed
+    at latent_idx=0. The VAE requires 1+8k frames, so we truncate to the nearest
+    valid frame count.
+
+    Args:
+        video_path: Path to the input video file.
+        height: Target height for conditioning frames.
+        width: Target width for conditioning frames.
+        video_encoder: Video encoder for converting frames to latents.
+        dtype: Data type for tensors.
+        device: Device for tensors.
+        strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
+        start_frame_idx: Starting latent frame index (usually 0).
+        max_frames: Maximum number of pixel frames to use (None = all frames).
+
+    Returns:
+        List with single VideoConditionByLatentIndex for the entire video.
+    """
+    from ltx_pipelines.utils.media_io import load_video_conditioning
+
+    # VAE requires 1 + 8k frames. Truncate to nearest valid count.
+    # Load video and truncate to valid frame count
+    frame_cap = max_frames if max_frames is not None else 100000
+    video = load_video_conditioning(
+        video_path=video_path,
+        height=height,
+        width=width,
+        frame_cap=frame_cap,
+        dtype=dtype,
+        device=device,
+    )
+
+    # Truncate to valid 1 + 8k frame count
+    num_frames = video.shape[2]
+    valid_frames = ((num_frames - 1) // 8) * 8 + 1
+    if valid_frames < num_frames:
+        video = video[:, :, :valid_frames, :, :]
+
+    # Encode entire video at once (proper temporal context)
+    encoded_video = video_encoder(video)
+
+    # Single conditioning that replaces all input frames
+    return [
+        VideoConditionByLatentIndex(
+            latent=encoded_video,
+            strength=strength,
+            latent_idx=start_frame_idx,
+        )
+    ]
+
+
 def euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState,
@@ -507,6 +574,7 @@ def denoise_audio_video(  # noqa: PLR0913
     noise_scale: float = 1.0,
     initial_video_latent: torch.Tensor | None = None,
     initial_audio_latent: torch.Tensor | None = None,
+    audio_conditionings: list[ConditioningItem] | None = None,
 ) -> tuple[LatentState, LatentState]:
     video_state, video_tools = noise_video_state(
         output_shape=output_shape,
@@ -521,7 +589,7 @@ def denoise_audio_video(  # noqa: PLR0913
     audio_state, audio_tools = noise_audio_state(
         output_shape=output_shape,
         noiser=noiser,
-        conditionings=[],
+        conditionings=audio_conditionings or [],
         components=components,
         dtype=dtype,
         device=device,
