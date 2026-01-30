@@ -29,7 +29,6 @@ from ltx_pipelines.utils.helpers import (
     get_device,
     image_conditionings_by_replacing_latent,
     simple_denoising_func,
-    video_conditionings_by_replacing_latent,
 )
 from ltx_pipelines.utils.media_io import encode_video
 from ltx_pipelines.utils.types import PipelineComponents
@@ -84,8 +83,6 @@ class DistilledPipeline:
         enhance_prompt: bool = False,
         image_crf: float | None = None,
         skip_cleanup: bool = False,
-        video_extend_path: str | None = None,
-        video_extend_strength: float = 1.0,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -142,21 +139,6 @@ class DistilledPipeline:
             image_crf=image_crf,
         )
 
-        # Add video extension conditioning if provided
-        if video_extend_path:
-            video_conds = video_conditionings_by_replacing_latent(
-                video_path=video_extend_path,
-                height=stage_1_output_shape.height,
-                width=stage_1_output_shape.width,
-                video_encoder=video_encoder,
-                dtype=dtype,
-                device=self.device,
-                strength=video_extend_strength,
-                start_frame_idx=0,
-                max_frames=None,
-            )
-            stage_1_conditionings.extend(video_conds)
-
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -189,22 +171,6 @@ class DistilledPipeline:
             device=self.device,
             image_crf=image_crf,
         )
-
-        # Add video extension conditioning for stage 2 as well
-        if video_extend_path:
-            video_conds = video_conditionings_by_replacing_latent(
-                video_path=video_extend_path,
-                height=stage_2_output_shape.height,
-                width=stage_2_output_shape.width,
-                video_encoder=video_encoder,
-                dtype=dtype,
-                device=self.device,
-                strength=video_extend_strength,
-                start_frame_idx=0,
-                max_frames=None,
-            )
-            stage_2_conditionings.extend(video_conds)
-
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,

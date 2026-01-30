@@ -2,11 +2,12 @@ import logging
 from collections.abc import Iterator
 
 import torch
+from safetensors import safe_open
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
-from ltx_core.conditioning import ConditioningItem, VideoConditionByKeyframeIndex
+from ltx_core.conditioning import ConditioningItem, VideoConditionByReferenceLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
@@ -81,6 +82,21 @@ class ICLoraPipeline:
         )
         self.device = device
 
+        # Read reference downscale factor from LoRA metadata.
+        # IC-LoRAs trained with low-resolution reference videos store this factor
+        # so inference can resize reference videos to match training conditions.
+        self.reference_downscale_factor = 1
+        for lora in loras:
+            scale = _read_lora_reference_downscale_factor(lora.path)
+            if scale != 1:
+                if self.reference_downscale_factor not in (1, scale):
+                    raise ValueError(
+                        f"Conflicting reference_downscale_factor values in LoRAs: "
+                        f"already have {self.reference_downscale_factor}, but {lora.path} "
+                        f"specifies {scale}. Cannot combine LoRAs with different reference scales."
+                    )
+                self.reference_downscale_factor = scale
+
     @torch.inference_mode()
     def __call__(
         self,
@@ -94,10 +110,6 @@ class ICLoraPipeline:
         video_conditioning: list[tuple[str, float]],
         enhance_prompt: bool = False,
         tiling_config: TilingConfig | None = None,
-        image_crf: float | None = None,
-        skip_cleanup: bool = False,
-        video_extend_mode: bool = False,
-        video_extend_max_frames: int | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -114,10 +126,9 @@ class ICLoraPipeline:
             )
         video_context, audio_context = encode_text(text_encoder, prompts=[prompt])[0]
 
-        if not skip_cleanup:
-            torch.cuda.synchronize()
-            del text_encoder
-            cleanup_memory()
+        torch.cuda.synchronize()
+        del text_encoder
+        cleanup_memory()
 
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -153,9 +164,6 @@ class ICLoraPipeline:
             width=stage_1_output_shape.width,
             video_encoder=video_encoder,
             num_frames=num_frames,
-            image_crf=image_crf,
-            video_extend_mode=video_extend_mode,
-            video_extend_max_frames=video_extend_max_frames,
         )
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
@@ -169,10 +177,9 @@ class ICLoraPipeline:
             device=self.device,
         )
 
-        if not skip_cleanup:
-            torch.cuda.synchronize()
-            del transformer
-            cleanup_memory()
+        torch.cuda.synchronize()
+        del transformer
+        cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LORA.
         upscaled_video_latent = upsample_video(
@@ -181,9 +188,8 @@ class ICLoraPipeline:
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
-        if not skip_cleanup:
-            torch.cuda.synchronize()
-            cleanup_memory()
+        torch.cuda.synchronize()
+        cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -211,7 +217,6 @@ class ICLoraPipeline:
             video_encoder=video_encoder,
             dtype=self.dtype,
             device=self.device,
-            image_crf=image_crf,
         )
 
         video_state, audio_state = denoise_audio_video(
@@ -229,11 +234,10 @@ class ICLoraPipeline:
             initial_audio_latent=audio_state.latent,
         )
 
-        if not skip_cleanup:
-            torch.cuda.synchronize()
-            del transformer
-            del video_encoder
-            cleanup_memory()
+        torch.cuda.synchronize()
+        del transformer
+        del video_encoder
+        cleanup_memory()
 
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
@@ -251,28 +255,7 @@ class ICLoraPipeline:
         width: int,
         num_frames: int,
         video_encoder: VideoEncoder,
-        image_crf: float | None = None,
-        video_extend_mode: bool = False,
-        video_extend_max_frames: int | None = None,
     ) -> list[ConditioningItem]:
-        """Create conditionings for video generation.
-
-        Args:
-            images: List of (path, frame_idx, strength) for image conditioning.
-            video_conditioning: List of (path, strength) for video conditioning.
-            height: Target height.
-            width: Target width.
-            num_frames: Total frames to generate.
-            video_encoder: Video encoder instance.
-            image_crf: CRF for image preprocessing.
-            video_extend_mode: If True, use frame replacement for video extension
-                (input frames are frozen, model generates continuation).
-                If False, use keyframe guidance for video-to-video transformation.
-            video_extend_max_frames: Max frames to use from input video in extend mode.
-
-        Returns:
-            List of conditioning items.
-        """
         conditionings = image_conditionings_by_replacing_latent(
             images=images,
             height=height,
@@ -280,40 +263,36 @@ class ICLoraPipeline:
             video_encoder=video_encoder,
             dtype=self.dtype,
             device=self.device,
-            image_crf=image_crf,
         )
 
-        for video_path, strength in video_conditioning:
-            if video_extend_mode:
-                # Video extension: REPLACE frames with input video (frozen in place)
-                from ltx_pipelines.utils.helpers import video_conditionings_by_replacing_latent
+        # Calculate scaled dimensions for reference video conditioning.
+        # IC-LoRAs trained with downscaled reference videos expect the same ratio at inference.
+        scale = self.reference_downscale_factor
+        if scale != 1 and (height % scale != 0 or width % scale != 0):
+            raise ValueError(
+                f"Output dimensions ({height}x{width}) must be divisible by reference_downscale_factor ({scale})"
+            )
+        ref_height = height // scale
+        ref_width = width // scale
 
-                video_conds = video_conditionings_by_replacing_latent(
-                    video_path=video_path,
-                    height=height,
-                    width=width,
-                    video_encoder=video_encoder,
-                    dtype=self.dtype,
-                    device=self.device,
+        for video_path, strength in video_conditioning:
+            # Load video at scaled-down resolution (if scale > 1)
+            video = load_video_conditioning(
+                video_path=video_path,
+                height=ref_height,
+                width=ref_width,
+                frame_cap=num_frames,
+                dtype=self.dtype,
+                device=self.device,
+            )
+            encoded_video = video_encoder(video)
+            conditionings.append(
+                VideoConditionByReferenceLatent(
+                    latent=encoded_video,
+                    downscale_factor=scale,
                     strength=strength,
-                    start_frame_idx=0,
-                    max_frames=video_extend_max_frames,
                 )
-                conditionings.extend(video_conds)
-            else:
-                # Video-to-video: APPEND keyframes as guidance signal
-                video = load_video_conditioning(
-                    video_path=video_path,
-                    height=height,
-                    width=width,
-                    frame_cap=num_frames,
-                    dtype=self.dtype,
-                    device=self.device,
-                )
-                encoded_video = video_encoder(video)
-                conditionings.append(
-                    VideoConditionByKeyframeIndex(keyframes=encoded_video, frame_idx=0, strength=strength)
-                )
+            )
 
         return conditionings
 
@@ -359,6 +338,27 @@ def main() -> None:
         output_path=args.output_path,
         video_chunks_number=video_chunks_number,
     )
+
+
+def _read_lora_reference_downscale_factor(lora_path: str) -> int:
+    """Read reference_downscale_factor from LoRA safetensors metadata.
+    Some IC-LoRA models are trained with reference videos at lower resolution than
+    the target output. This allows for more efficient training and can improve
+    generalization. The downscale factor indicates the ratio between target and
+    reference resolutions (e.g., factor=2 means reference is half the resolution).
+    Args:
+        lora_path: Path to the LoRA .safetensors file
+    Returns:
+        The reference downscale factor (1 if not specified in metadata, meaning
+        reference and target have the same resolution)
+    """
+    try:
+        with safe_open(lora_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+            return int(metadata.get("reference_downscale_factor", 1))
+    except Exception as e:
+        logging.warning(f"Failed to read metadata from LoRA file '{lora_path}': {e}")
+        return 1
 
 
 if __name__ == "__main__":
