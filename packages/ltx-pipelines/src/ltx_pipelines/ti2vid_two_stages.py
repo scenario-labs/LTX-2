@@ -48,23 +48,40 @@ def blend_audio_with_crossfade(
 ) -> torch.Tensor:
     """Blend input audio with generated audio using crossfade at the transition point.
 
+    Note: This is post-processing blending, not true audio conditioning.
+    The generated audio is created independently, then blended with input audio.
+
     Args:
-        input_audio: Audio from input video, shape (samples,) or (channels, samples).
-        generated_audio: Generated audio for full duration, same shape convention.
+        input_audio: Audio from input video. Can be:
+            - Shape (frames, channels, samples_per_frame) from decode_audio_from_file
+            - Shape (samples,) flat mono
+            - Shape (channels, samples) stereo
+        generated_audio: Generated audio, typically shape (samples,) mono.
         input_duration_samples: Number of samples from input video duration.
         crossfade_samples: Number of samples for crossfade region.
-        sample_rate: Audio sample rate (for logging).
+        sample_rate: Audio sample rate.
 
     Returns:
         Blended audio tensor with input audio preserved and crossfade to generated.
     """
-    # Ensure both are 1D (mono) for simplicity - handle stereo if needed
-    if input_audio.ndim == 2:
-        input_audio = input_audio.mean(dim=0)  # Convert to mono
+    # Flatten input audio from decode_audio_from_file format [frames, channels, samples_per_frame]
+    if input_audio.ndim == 3:
+        # Shape: [frames, channels, samples_per_frame] -> [channels, total_samples]
+        frames, channels, samples_per_frame = input_audio.shape
+        input_audio = input_audio.permute(1, 0, 2).reshape(channels, -1)
+        # Convert to mono by averaging channels
+        input_audio = input_audio.mean(dim=0)
+    elif input_audio.ndim == 2:
+        # Shape: [channels, samples] -> mono
+        input_audio = input_audio.mean(dim=0)
+    # else: already 1D mono
+
+    # Ensure generated audio is also 1D
     if generated_audio.ndim == 2:
-        generated_audio = generated_audio.mean(dim=0)  # Convert to mono
+        generated_audio = generated_audio.mean(dim=0)
 
     total_samples = generated_audio.shape[0]
+    input_total_samples = input_audio.shape[0]
 
     # If input is longer than output, just use generated
     if input_duration_samples >= total_samples:
@@ -79,8 +96,9 @@ def blend_audio_with_crossfade(
     actual_crossfade = crossfade_end - crossfade_start
 
     # Copy input audio up to crossfade start
-    input_samples_available = min(input_audio.shape[0], crossfade_start)
-    output[:input_samples_available] = input_audio[:input_samples_available]
+    input_samples_available = min(input_total_samples, crossfade_start)
+    if input_samples_available > 0:
+        output[:input_samples_available] = input_audio[:input_samples_available]
 
     # Apply crossfade in the transition region
     if actual_crossfade > 0:
@@ -89,8 +107,8 @@ def blend_audio_with_crossfade(
         fade_in = torch.linspace(0.0, 1.0, actual_crossfade, device=generated_audio.device)
 
         # Get the audio segments for crossfade
-        input_fade_start = min(crossfade_start, input_audio.shape[0])
-        input_fade_end = min(crossfade_end, input_audio.shape[0])
+        input_fade_start = min(crossfade_start, input_total_samples)
+        input_fade_end = min(crossfade_end, input_total_samples)
         input_fade_len = input_fade_end - input_fade_start
 
         if input_fade_len > 0:
