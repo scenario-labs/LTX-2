@@ -8,9 +8,12 @@ from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
     AUDIO_VAE_DECODER_COMFY_KEYS_FILTER,
+    AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
     VOCODER_COMFY_KEYS_FILTER,
     AudioDecoder,
     AudioDecoderConfigurator,
+    AudioEncoder,
+    AudioEncoderConfigurator,
     Vocoder,
     VocoderConfigurator,
 )
@@ -145,6 +148,13 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            self.audio_encoder_builder = Builder(
+                model_path=self.checkpoint_path,
+                model_class_configurator=AudioEncoderConfigurator,
+                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+                registry=self.registry,
+            )
+
             self.vocoder_builder = Builder(
                 model_path=self.checkpoint_path,
                 model_class_configurator=VocoderConfigurator,
@@ -197,6 +207,7 @@ class ModelLedger:
         video_encoder: bool = True,
         transformer: bool = True,
         video_decoder: bool = True,
+        audio_encoder: bool = True,
         audio_decoder: bool = True,
         vocoder: bool = True,
         spatial_upsampler: bool = True,
@@ -213,6 +224,7 @@ class ModelLedger:
             video_encoder: Cache the video encoder if available.
             transformer: Cache the transformer if available.
             video_decoder: Cache the video decoder if available.
+            audio_encoder: Cache the audio encoder if available.
             audio_decoder: Cache the audio decoder if available.
             vocoder: Cache the vocoder if available.
             spatial_upsampler: Cache the spatial upsampler if available.
@@ -228,6 +240,9 @@ class ModelLedger:
 
         if video_decoder and hasattr(self, "vae_decoder_builder"):
             self._cached_components["video_decoder"] = self._build_video_decoder()
+
+        if audio_encoder and hasattr(self, "audio_encoder_builder"):
+            self._cached_components["audio_encoder"] = self._build_audio_encoder()
 
         if audio_decoder and hasattr(self, "audio_decoder_builder"):
             self._cached_components["audio_decoder"] = self._build_audio_decoder()
@@ -376,6 +391,12 @@ class ModelLedger:
             encoder.tokenizer.max_length = self.tokenizer_max_length
         return encoder
 
+    def _build_audio_encoder(self) -> AudioEncoder:
+        """Internal method to build a new audio encoder instance."""
+        model = self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
+        model.eval()  # PyTorch evaluation mode
+        return model
+
     def _build_audio_decoder(self) -> AudioDecoder:
         """Internal method to build a new audio decoder instance."""
         model = self.audio_decoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
@@ -430,6 +451,15 @@ class ModelLedger:
         if "text_encoder" in self._cached_components:
             return self._cached_components["text_encoder"]
         return self._build_text_encoder()
+
+    def audio_encoder(self) -> AudioEncoder:
+        if not hasattr(self, "audio_encoder_builder"):
+            raise ValueError(
+                "Audio encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+        if "audio_encoder" in self._cached_components:
+            return self._cached_components["audio_encoder"]
+        return self._build_audio_encoder()
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):

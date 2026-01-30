@@ -169,6 +169,85 @@ def video_conditionings_by_replacing_latent(
     ]
 
 
+def audio_conditionings_by_replacing_latent(
+    audio_path: str,
+    audio_encoder: "AudioEncoder",
+    dtype: torch.dtype,
+    device: torch.device,
+    strength: float = 1.0,
+    start_frame_idx: int = 0,
+    sample_rate: int = 16000,
+    mel_hop_length: int = 160,
+    n_fft: int = 1024,
+    mel_bins: int = 64,
+) -> list[ConditioningItem]:
+    """Create conditioning that REPLACES audio latent frames with encoded audio.
+
+    This is used for audio extension: the input audio is frozen in place
+    (with strength=1.0) and the model generates continuation audio after it.
+
+    Args:
+        audio_path: Path to the input audio/video file with audio track.
+        audio_encoder: Audio encoder for converting spectrograms to latents.
+        dtype: Data type for tensors.
+        device: Device for tensors.
+        strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
+        start_frame_idx: Starting latent frame index (usually 0).
+        sample_rate: Audio sample rate (default 16000 to match model).
+        mel_hop_length: Hop length for mel spectrogram (default 160).
+        n_fft: FFT size for spectrogram (default 1024).
+        mel_bins: Number of mel bins (default 64).
+
+    Returns:
+        List with single AudioConditionByLatentIndex for the audio, or empty list if no audio.
+    """
+    from ltx_core.conditioning import AudioConditionByLatentIndex
+    from ltx_core.model.audio_vae.ops import AudioProcessor
+    from ltx_pipelines.utils.media_io import decode_audio_from_file
+
+    # Load audio from file
+    audio_waveform = decode_audio_from_file(audio_path, device=device)
+    if audio_waveform is None:
+        # No audio track in file
+        return []
+
+    # Ensure waveform has correct shape: (batch, channels, samples) or (batch, samples)
+    if audio_waveform.ndim == 1:
+        # (samples,) -> (1, 1, samples)
+        audio_waveform = audio_waveform.unsqueeze(0).unsqueeze(0)
+    elif audio_waveform.ndim == 2:
+        # (channels, samples) -> (1, channels, samples)
+        audio_waveform = audio_waveform.unsqueeze(0)
+
+    # Convert to mel spectrogram
+    audio_processor = AudioProcessor(
+        sample_rate=sample_rate,
+        mel_bins=mel_bins,
+        mel_hop_length=mel_hop_length,
+        n_fft=n_fft,
+    ).to(device=device, dtype=dtype)
+
+    # Note: decode_audio_from_file returns audio at original sample rate
+    # AudioProcessor will resample if needed
+    # Assume input is already at target sample rate for simplicity
+    mel_spectrogram = audio_processor.waveform_to_mel(
+        waveform=audio_waveform.to(dtype),
+        waveform_sample_rate=sample_rate,
+    )
+
+    # Encode spectrogram to latents
+    encoded_audio = audio_encoder(mel_spectrogram)
+
+    # Single conditioning that replaces input audio frames
+    return [
+        AudioConditionByLatentIndex(
+            latent=encoded_audio,
+            strength=strength,
+            latent_idx=start_frame_idx,
+        )
+    ]
+
+
 def euler_denoising_loop(
     sigmas: torch.Tensor,
     video_state: LatentState,
@@ -574,6 +653,7 @@ def denoise_audio_video(  # noqa: PLR0913
     noise_scale: float = 1.0,
     initial_video_latent: torch.Tensor | None = None,
     initial_audio_latent: torch.Tensor | None = None,
+    audio_conditionings: list[ConditioningItem] | None = None,
 ) -> tuple[LatentState, LatentState]:
     video_state, video_tools = noise_video_state(
         output_shape=output_shape,
@@ -588,7 +668,7 @@ def denoise_audio_video(  # noqa: PLR0913
     audio_state, audio_tools = noise_audio_state(
         output_shape=output_shape,
         noiser=noiser,
-        conditionings=[],
+        conditionings=audio_conditionings or [],
         components=components,
         dtype=dtype,
         device=device,

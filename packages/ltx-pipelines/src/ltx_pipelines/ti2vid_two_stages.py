@@ -23,6 +23,7 @@ from ltx_pipelines.utils.constants import (
 )
 from ltx_pipelines.utils.helpers import (
     assert_resolution,
+    audio_conditionings_by_replacing_latent,
     cleanup_memory,
     denoise_audio_video,
     euler_denoising_loop,
@@ -165,7 +166,8 @@ class TI2VidTwoStagesPipeline:
             image_crf=image_crf,
         )
 
-        # Add video extension conditioning if provided
+        # Add video and audio extension conditioning if provided
+        stage_1_audio_conditionings: list = []
         if video_extend_path:
             video_conds = video_conditionings_by_replacing_latent(
                 video_path=video_extend_path,
@@ -180,6 +182,18 @@ class TI2VidTwoStagesPipeline:
             )
             stage_1_conditionings.extend(video_conds)
 
+            # Create audio conditioning from input video's audio track
+            audio_encoder = self.stage_1_model_ledger.audio_encoder()
+            audio_conds = audio_conditionings_by_replacing_latent(
+                audio_path=video_extend_path,
+                audio_encoder=audio_encoder,
+                dtype=dtype,
+                device=self.device,
+                strength=video_extend_strength,
+                start_frame_idx=0,
+            )
+            stage_1_audio_conditionings.extend(audio_conds)
+
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
             conditionings=stage_1_conditionings,
@@ -190,6 +204,7 @@ class TI2VidTwoStagesPipeline:
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
+            audio_conditionings=stage_1_audio_conditionings if stage_1_audio_conditionings else None,
         )
 
         if not skip_cleanup:
@@ -237,7 +252,8 @@ class TI2VidTwoStagesPipeline:
             image_crf=image_crf,
         )
 
-        # Add video extension conditioning for stage 2 as well
+        # Add video and audio extension conditioning for stage 2 as well
+        stage_2_audio_conditionings: list = []
         if video_extend_path:
             video_conds = video_conditionings_by_replacing_latent(
                 video_path=video_extend_path,
@@ -252,6 +268,19 @@ class TI2VidTwoStagesPipeline:
             )
             stage_2_conditionings.extend(video_conds)
 
+            # Reuse audio encoder from stage 1 (still loaded)
+            # Audio conditioning is resolution-independent
+            audio_encoder = self.stage_1_model_ledger.audio_encoder()
+            audio_conds = audio_conditionings_by_replacing_latent(
+                audio_path=video_extend_path,
+                audio_encoder=audio_encoder,
+                dtype=dtype,
+                device=self.device,
+                strength=video_extend_strength,
+                start_frame_idx=0,
+            )
+            stage_2_audio_conditionings.extend(audio_conds)
+
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_2_output_shape,
             conditionings=stage_2_conditionings,
@@ -265,6 +294,7 @@ class TI2VidTwoStagesPipeline:
             noise_scale=distilled_sigmas[0],
             initial_video_latent=upscaled_video_latent,
             initial_audio_latent=audio_state.latent,
+            audio_conditionings=stage_2_audio_conditionings if stage_2_audio_conditionings else None,
         )
 
         if not skip_cleanup:
