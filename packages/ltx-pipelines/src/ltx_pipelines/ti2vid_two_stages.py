@@ -153,7 +153,9 @@ class TI2VidTwoStagesPipeline:
         with torch.inference_mode():
             audio_latent = audio_encoder(mel)
 
-        # Align latent duration to video frames
+        # For video extension: DON'T pad to full output duration
+        # Only condition on the input audio portion, let the model generate continuation
+        # If input audio is longer than output video, trim it
         audio_downsample = getattr(
             getattr(audio_encoder, "patchifier", None), "audio_latent_downsample_factor", 4
         )
@@ -171,21 +173,14 @@ class TI2VidTwoStagesPipeline:
             hop_length=mel_hop,
             audio_latent_downsample_factor=audio_downsample,
         )
-        target_frames = int(target_shape.frames)
+        max_frames = int(target_shape.frames)
 
-        # Pad or trim to match video duration
-        if audio_latent.shape[2] < target_frames:
-            pad_frames = target_frames - audio_latent.shape[2]
-            pad = torch.zeros(
-                (audio_latent.shape[0], audio_latent.shape[1], pad_frames, audio_latent.shape[3]),
-                device=audio_latent.device,
-                dtype=audio_latent.dtype,
-            )
-            audio_latent = torch.cat([audio_latent, pad], dim=2)
-        elif audio_latent.shape[2] > target_frames:
-            audio_latent = audio_latent[:, :, :target_frames, :]
+        # Only trim if audio is longer than output video - do NOT pad
+        # This way, conditioning only applies to input audio duration
+        if audio_latent.shape[2] > max_frames:
+            audio_latent = audio_latent[:, :, :max_frames, :]
 
-        # Return conditioning
+        # Return conditioning - will only affect tokens for input audio duration
         audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
         return [AudioConditionByLatent(audio_latent, strength)]
 
