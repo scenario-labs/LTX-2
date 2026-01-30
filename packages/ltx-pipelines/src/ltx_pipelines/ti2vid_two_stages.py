@@ -100,8 +100,13 @@ class TI2VidTwoStagesPipeline:
         Returns:
             List containing AudioConditionByLatent, or None if strength <= 0.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         strength = float(strength)
+        logger.info(f"[AudioCond] Building audio conditioning with strength={strength}")
         if strength <= 0.0:
+            logger.info("[AudioCond] Strength <= 0, returning None")
             return None
 
         # Normalize waveform shape to (B, C, T)
@@ -150,8 +155,10 @@ class TI2VidTwoStagesPipeline:
         enc_dtype = audio_params.dtype if audio_params is not None else self.dtype
 
         mel = mel.to(device=enc_device, dtype=enc_dtype)
+        logger.info(f"[AudioCond] Mel shape: {mel.shape}")
         with torch.inference_mode():
             audio_latent = audio_encoder(mel)
+        logger.info(f"[AudioCond] Audio latent from encoder: {audio_latent.shape}")
 
         # For video extension: DON'T pad to full output duration
         # Only condition on the input audio portion, let the model generate continuation
@@ -174,14 +181,17 @@ class TI2VidTwoStagesPipeline:
             audio_latent_downsample_factor=audio_downsample,
         )
         max_frames = int(target_shape.frames)
+        logger.info(f"[AudioCond] Target max_frames={max_frames}, input frames={audio_latent.shape[2]}")
 
         # Only trim if audio is longer than output video - do NOT pad
         # This way, conditioning only applies to input audio duration
         if audio_latent.shape[2] > max_frames:
             audio_latent = audio_latent[:, :, :max_frames, :]
+            logger.info(f"[AudioCond] Trimmed to {audio_latent.shape}")
 
         # Return conditioning - will only affect tokens for input audio duration
         audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
+        logger.info(f"[AudioCond] Final audio latent shape: {audio_latent.shape}, strength={strength}")
         return [AudioConditionByLatent(audio_latent, strength)]
 
     @torch.inference_mode()

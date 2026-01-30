@@ -36,8 +36,15 @@ class AudioConditionByLatent(ConditioningItem):
         Returns:
             Modified latent state with audio conditioning applied.
         """
+        import logging
+        logger = logging.getLogger(__name__)
+
         tokens = latent_tools.patchifier.patchify(self.latent)
         num_tokens = tokens.shape[1]
+        total_tokens = latent_state.latent.shape[1]
+        logger.info(f"[AudioCond.apply_to] Input latent: {self.latent.shape}")
+        logger.info(f"[AudioCond.apply_to] Patchified tokens: {tokens.shape}")
+        logger.info(f"[AudioCond.apply_to] Replacing {num_tokens}/{total_tokens} tokens, strength={self.strength}")
 
         latent_state = latent_state.clone()
 
@@ -46,6 +53,8 @@ class AudioConditionByLatent(ConditioningItem):
         latent_state.clean_latent[:, :num_tokens] = tokens
         # Set denoise mask: 0 = full denoising, 1 = no denoising
         # strength=1.0 means no denoising (preserve input)
-        latent_state.denoise_mask[:, :num_tokens] = 1.0 - self.strength
+        mask_value = 1.0 - self.strength
+        latent_state.denoise_mask[:, :num_tokens] = mask_value
+        logger.info(f"[AudioCond.apply_to] Set denoise_mask[:, :{num_tokens}] = {mask_value}")
 
         return latent_state
