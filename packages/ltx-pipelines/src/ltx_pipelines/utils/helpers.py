@@ -114,8 +114,6 @@ def video_conditionings_by_replacing_latent(
     context_seconds: float | None = None,
     frame_rate: float = 25.0,
     output_latent_frames: int = 0,
-    seam_blend_frames: int = 1,
-    seam_strength: float = 0.7,
 ) -> list[ConditioningItem]:
     """Create conditioning that REPLACES latent frames with encoded video.
 
@@ -125,9 +123,6 @@ def video_conditionings_by_replacing_latent(
     The entire video is encoded at once (preserving temporal context). The VAE
     requires 1+8k pixel frames. The start_frame_idx is calculated internally
     based on direction and actual frame counts after all truncation.
-
-    To reduce visible seams at the transition, the latent frame(s) at the seam
-    point use reduced strength, allowing partial denoising for smoother blending.
 
     Args:
         video_path: Path to the input video file.
@@ -147,13 +142,9 @@ def video_conditionings_by_replacing_latent(
         frame_rate: Video frame rate, used to convert context_seconds to frames.
         output_latent_frames: Total output latent frames. Required for backward
             direction to calculate start_frame_idx.
-        seam_blend_frames: Number of latent frames at the seam to use reduced
-            strength for smoother transition. Default 1.
-        seam_strength: Strength for seam frames (0.0-1.0). Lower = more denoising
-            at the seam for smoother blending. Default 0.7.
 
     Returns:
-        List of VideoConditionByLatentIndex items for the video.
+        List with single VideoConditionByLatentIndex for the entire video.
     """
     from ltx_pipelines.utils.media_io import load_video_conditioning
 
@@ -203,65 +194,13 @@ def video_conditionings_by_replacing_latent(
     else:  # backward
         start_frame_idx = output_latent_frames - input_latent_frames
 
-    # Create conditioning items with seam blending
-    conditionings = []
-    seam_blend_frames = min(seam_blend_frames, input_latent_frames)
-
-    if seam_blend_frames > 0 and seam_strength < strength:
-        if direction == "backward":
-            # Seam at START of input: first N latent frames get reduced strength
-            # Seam frames (reduced strength)
-            seam_latent = encoded_video[:, :, :seam_blend_frames, :, :]
-            conditionings.append(
-                VideoConditionByLatentIndex(
-                    latent=seam_latent,
-                    strength=seam_strength,
-                    latent_idx=start_frame_idx,
-                )
-            )
-            # Rest of frames (full strength)
-            if input_latent_frames > seam_blend_frames:
-                rest_latent = encoded_video[:, :, seam_blend_frames:, :, :]
-                conditionings.append(
-                    VideoConditionByLatentIndex(
-                        latent=rest_latent,
-                        strength=strength,
-                        latent_idx=start_frame_idx + seam_blend_frames,
-                    )
-                )
-        else:  # forward
-            # Seam at END of input: last N latent frames get reduced strength
-            # Main frames (full strength)
-            if input_latent_frames > seam_blend_frames:
-                main_latent = encoded_video[:, :, :-seam_blend_frames, :, :]
-                conditionings.append(
-                    VideoConditionByLatentIndex(
-                        latent=main_latent,
-                        strength=strength,
-                        latent_idx=start_frame_idx,
-                    )
-                )
-            # Seam frames (reduced strength)
-            seam_latent = encoded_video[:, :, -seam_blend_frames:, :, :]
-            seam_start_idx = start_frame_idx + input_latent_frames - seam_blend_frames
-            conditionings.append(
-                VideoConditionByLatentIndex(
-                    latent=seam_latent,
-                    strength=seam_strength,
-                    latent_idx=seam_start_idx,
-                )
-            )
-    else:
-        # No seam blending, single conditioning
-        conditionings.append(
-            VideoConditionByLatentIndex(
-                latent=encoded_video,
-                strength=strength,
-                latent_idx=start_frame_idx,
-            )
+    return [
+        VideoConditionByLatentIndex(
+            latent=encoded_video,
+            strength=strength,
+            latent_idx=start_frame_idx,
         )
-
-    return conditionings
+    ]
 
 
 def euler_denoising_loop(
