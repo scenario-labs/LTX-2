@@ -87,6 +87,7 @@ class TI2VidTwoStagesPipeline:
         num_frames: int,
         fps: float,
         strength: float,
+        direction: str = "forward",
     ) -> list[AudioConditionByLatent] | None:
         """Convert input waveform to audio conditioning for the diffusion process.
 
@@ -96,6 +97,8 @@ class TI2VidTwoStagesPipeline:
             num_frames: Number of video frames (for duration alignment).
             fps: Video frame rate.
             strength: Conditioning strength (0-1). 1.0 = fully preserve input audio.
+            direction: Extend direction ('forward' or 'backward'). For backward,
+                audio is placed at the end to match video positioning.
 
         Returns:
             List containing AudioConditionByLatent, or None if strength <= 0.
@@ -181,7 +184,9 @@ class TI2VidTwoStagesPipeline:
             audio_latent = audio_latent[:, :, :max_frames, :]
 
         audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
-        return [AudioConditionByLatent(audio_latent, strength)]
+        # For backward extend, place audio at the end (matching video positioning)
+        place_at_end = direction == "backward"
+        return [AudioConditionByLatent(audio_latent, strength, place_at_end=place_at_end)]
 
     @torch.inference_mode()
     def __call__(  # noqa: PLR0913
@@ -222,6 +227,7 @@ class TI2VidTwoStagesPipeline:
                 num_frames=num_frames,
                 fps=frame_rate,
                 strength=audio_strength,
+                direction=video_extend_direction,
             )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
