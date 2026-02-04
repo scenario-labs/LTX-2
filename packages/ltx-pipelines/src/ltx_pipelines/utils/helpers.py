@@ -110,17 +110,19 @@ def video_conditionings_by_replacing_latent(
     dtype: torch.dtype,
     device: torch.device,
     strength: float = 1.0,
-    start_frame_idx: int = 0,
-    max_frames: int | None = None,
+    direction: str = "forward",
+    context_seconds: float | None = None,
+    frame_rate: float = 25.0,
+    output_latent_frames: int = 0,
 ) -> list[ConditioningItem]:
     """Create conditioning that REPLACES latent frames with encoded video.
 
     This is used for video extension: the input video frames are frozen in place
-    (with strength=1.0) and the model generates continuation frames after them.
+    (with strength=1.0) and the model generates continuation frames around them.
 
-    The entire video is encoded at once (preserving temporal context) and placed
-    at latent_idx=0. The VAE requires 1+8k frames, so we truncate to the nearest
-    valid frame count.
+    The entire video is encoded at once (preserving temporal context). The VAE
+    requires 1+8k pixel frames. The start_frame_idx is calculated internally
+    based on direction and actual frame counts after all truncation.
 
     Args:
         video_path: Path to the input video file.
@@ -130,36 +132,68 @@ def video_conditionings_by_replacing_latent(
         dtype: Data type for tensors.
         device: Device for tensors.
         strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
-        start_frame_idx: Starting latent frame index (usually 0).
-        max_frames: Maximum number of pixel frames to use (None = all frames).
+        direction: Extension direction.
+            - "forward": input at start, generate after (start_idx=0)
+            - "backward": input at end, generate before (start_idx=output-input)
+        context_seconds: Max seconds of input video to use as context.
+            None uses entire video. Preserves the portion closest to the seam:
+            - forward: keeps END of input (seam is at end)
+            - backward: keeps START of input (seam is at start)
+        frame_rate: Video frame rate, used to convert context_seconds to frames.
+        output_latent_frames: Total output latent frames. Required for backward
+            direction to calculate start_frame_idx.
 
     Returns:
         List with single VideoConditionByLatentIndex for the entire video.
     """
     from ltx_pipelines.utils.media_io import load_video_conditioning
 
-    # VAE requires 1 + 8k frames. Truncate to nearest valid count.
-    # Load video and truncate to valid frame count
-    frame_cap = max_frames if max_frames is not None else 100000
+    if direction not in ("forward", "backward"):
+        raise ValueError(f"direction must be 'forward' or 'backward', got '{direction}'")
+
+    # For forward: preserve END (seam point), slice from start
+    # For backward: preserve START (seam point), slice from end
+    preserve_end = direction == "forward"
+
+    # Load all frames
     video = load_video_conditioning(
         video_path=video_path,
         height=height,
         width=width,
-        frame_cap=frame_cap,
+        frame_cap=100000,
         dtype=dtype,
         device=device,
     )
-
-    # Truncate to valid 1 + 8k frame count
     num_frames = video.shape[2]
+
+    # Apply context_seconds limit
+    if context_seconds is not None:
+        max_frames = int(context_seconds * frame_rate)
+        if num_frames > max_frames:
+            if preserve_end:
+                video = video[:, :, -max_frames:, :, :]
+            else:
+                video = video[:, :, :max_frames, :, :]
+            num_frames = video.shape[2]
+
+    # Truncate to valid 1+8k frame count (VAE requirement)
     valid_frames = ((num_frames - 1) // 8) * 8 + 1
     if valid_frames < num_frames:
-        video = video[:, :, :valid_frames, :, :]
+        if preserve_end:
+            video = video[:, :, -valid_frames:, :, :]
+        else:
+            video = video[:, :, :valid_frames, :, :]
 
     # Encode entire video at once (proper temporal context)
     encoded_video = video_encoder(video)
+    input_latent_frames = encoded_video.shape[2]
 
-    # Single conditioning that replaces all input frames
+    # Calculate start_frame_idx based on direction and actual frame count
+    if direction == "forward":
+        start_frame_idx = 0
+    else:  # backward
+        start_frame_idx = output_latent_frames - input_latent_frames
+
     return [
         VideoConditionByLatentIndex(
             latent=encoded_video,
