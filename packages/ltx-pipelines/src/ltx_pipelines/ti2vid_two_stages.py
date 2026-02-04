@@ -87,7 +87,6 @@ class TI2VidTwoStagesPipeline:
         num_frames: int,
         fps: float,
         strength: float,
-        direction: str = "forward",
     ) -> list[AudioConditionByLatent] | None:
         """Convert input waveform to audio conditioning for the diffusion process.
 
@@ -97,8 +96,6 @@ class TI2VidTwoStagesPipeline:
             num_frames: Number of video frames (for duration alignment).
             fps: Video frame rate.
             strength: Conditioning strength (0-1). 1.0 = fully preserve input audio.
-            direction: Extend direction ('forward' or 'backward'). For backward,
-                audio is placed at the end to match video positioning.
 
         Returns:
             List containing AudioConditionByLatent, or None if strength <= 0.
@@ -184,9 +181,7 @@ class TI2VidTwoStagesPipeline:
             audio_latent = audio_latent[:, :, :max_frames, :]
 
         audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
-        # For backward extend, place audio at the end (matching video positioning)
-        place_at_end = direction == "backward"
-        return [AudioConditionByLatent(audio_latent, strength, place_at_end=place_at_end)]
+        return [AudioConditionByLatent(audio_latent, strength)]
 
     @torch.inference_mode()
     def __call__(  # noqa: PLR0913
@@ -208,7 +203,6 @@ class TI2VidTwoStagesPipeline:
         skip_cleanup: bool = False,
         video_extend_path: str | None = None,
         video_extend_strength: float = 1.0,
-        video_extend_direction: str = "forward",
         video_extend_context_seconds: float | None = None,
         input_waveform: torch.Tensor | None = None,
         input_waveform_sample_rate: int | None = None,
@@ -227,7 +221,6 @@ class TI2VidTwoStagesPipeline:
                 num_frames=num_frames,
                 fps=frame_rate,
                 strength=audio_strength,
-                direction=video_extend_direction,
             )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -296,7 +289,6 @@ class TI2VidTwoStagesPipeline:
 
         # Add video extension conditioning if provided
         if video_extend_path:
-            output_latent_frames = (num_frames - 1) // 8 + 1
             video_conds = video_conditionings_by_replacing_latent(
                 video_path=video_extend_path,
                 height=stage_1_output_shape.height,
@@ -305,10 +297,8 @@ class TI2VidTwoStagesPipeline:
                 dtype=dtype,
                 device=self.device,
                 strength=video_extend_strength,
-                direction=video_extend_direction,
                 context_seconds=video_extend_context_seconds,
                 frame_rate=frame_rate,
-                output_latent_frames=output_latent_frames,
             )
             stage_1_conditionings.extend(video_conds)
 
@@ -380,10 +370,8 @@ class TI2VidTwoStagesPipeline:
                 dtype=dtype,
                 device=self.device,
                 strength=video_extend_strength,
-                direction=video_extend_direction,
                 context_seconds=video_extend_context_seconds,
                 frame_rate=frame_rate,
-                output_latent_frames=output_latent_frames,
             )
             stage_2_conditionings.extend(video_conds)
 

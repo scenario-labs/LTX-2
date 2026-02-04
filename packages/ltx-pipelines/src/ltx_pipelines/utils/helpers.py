@@ -110,19 +110,16 @@ def video_conditionings_by_replacing_latent(
     dtype: torch.dtype,
     device: torch.device,
     strength: float = 1.0,
-    direction: str = "forward",
     context_seconds: float | None = None,
     frame_rate: float = 25.0,
-    output_latent_frames: int = 0,
 ) -> list[ConditioningItem]:
     """Create conditioning that REPLACES latent frames with encoded video.
 
     This is used for video extension: the input video frames are frozen in place
-    (with strength=1.0) and the model generates continuation frames around them.
+    (with strength=1.0) and the model generates continuation frames after them.
 
     The entire video is encoded at once (preserving temporal context). The VAE
-    requires 1+8k pixel frames. The start_frame_idx is calculated internally
-    based on direction and actual frame counts after all truncation.
+    requires 1+8k pixel frames. Input is placed at position 0 (start).
 
     Args:
         video_path: Path to the input video file.
@@ -132,28 +129,14 @@ def video_conditionings_by_replacing_latent(
         dtype: Data type for tensors.
         device: Device for tensors.
         strength: Conditioning strength (1.0 = fully frozen, 0.0 = fully denoised).
-        direction: Extension direction.
-            - "forward": input at start, generate after (start_idx=0)
-            - "backward": input at end, generate before (start_idx=output-input)
         context_seconds: Max seconds of input video to use as context.
-            None uses entire video. Preserves the portion closest to the seam:
-            - forward: keeps END of input (seam is at end)
-            - backward: keeps START of input (seam is at start)
+            None uses entire video. Preserves the END of input (seam point).
         frame_rate: Video frame rate, used to convert context_seconds to frames.
-        output_latent_frames: Total output latent frames. Required for backward
-            direction to calculate start_frame_idx.
 
     Returns:
         List with single VideoConditionByLatentIndex for the entire video.
     """
     from ltx_pipelines.utils.media_io import load_video_conditioning
-
-    if direction not in ("forward", "backward"):
-        raise ValueError(f"direction must be 'forward' or 'backward', got '{direction}'")
-
-    # For forward: preserve END (seam point), slice from start
-    # For backward: preserve START (seam point), slice from end
-    preserve_end = direction == "forward"
 
     # Load all frames
     video = load_video_conditioning(
@@ -166,39 +149,26 @@ def video_conditionings_by_replacing_latent(
     )
     num_frames = video.shape[2]
 
-    # Apply context_seconds limit
+    # Apply context_seconds limit (preserve END - seam point)
     if context_seconds is not None:
         max_frames = int(context_seconds * frame_rate)
         if num_frames > max_frames:
-            if preserve_end:
-                video = video[:, :, -max_frames:, :, :]
-            else:
-                video = video[:, :, :max_frames, :, :]
+            video = video[:, :, -max_frames:, :, :]
             num_frames = video.shape[2]
 
-    # Truncate to valid 1+8k frame count (VAE requirement)
+    # Truncate to valid 1+8k frame count (VAE requirement), preserve END
     valid_frames = ((num_frames - 1) // 8) * 8 + 1
     if valid_frames < num_frames:
-        if preserve_end:
-            video = video[:, :, -valid_frames:, :, :]
-        else:
-            video = video[:, :, :valid_frames, :, :]
+        video = video[:, :, -valid_frames:, :, :]
 
     # Encode entire video at once (proper temporal context)
     encoded_video = video_encoder(video)
-    input_latent_frames = encoded_video.shape[2]
-
-    # Calculate start_frame_idx based on direction and actual frame count
-    if direction == "forward":
-        start_frame_idx = 0
-    else:  # backward
-        start_frame_idx = output_latent_frames - input_latent_frames
 
     return [
         VideoConditionByLatentIndex(
             latent=encoded_video,
             strength=strength,
-            latent_idx=start_frame_idx,
+            latent_idx=0,
         )
     ]
 
