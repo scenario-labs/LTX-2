@@ -11,7 +11,8 @@ from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning.types import AudioConditionByLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
+from ltx_core.model.audio_vae import AudioProcessor
+from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
@@ -87,6 +88,7 @@ class TI2VidTwoStagesPipeline:
         num_frames: int,
         fps: float,
         strength: float,
+        pad_to_duration: bool = False,
     ) -> list[AudioConditionByLatent] | None:
         """Convert input waveform to audio conditioning for the diffusion process.
 
@@ -96,6 +98,9 @@ class TI2VidTwoStagesPipeline:
             num_frames: Number of video frames (for duration alignment).
             fps: Video frame rate.
             strength: Conditioning strength (0-1). 1.0 = fully preserve input audio.
+            pad_to_duration: If True, pad short audio with silence to match video duration.
+                Use True for audio-to-video where the entire video should be conditioned.
+                Use False for video extension where only the input portion should be conditioned.
 
         Returns:
             List containing AudioConditionByLatent, or None if strength <= 0.
@@ -175,10 +180,21 @@ class TI2VidTwoStagesPipeline:
         )
         max_frames = int(target_shape.frames)
 
-        # Only trim if audio is longer than output video - do NOT pad
-        # This way, conditioning only applies to input audio duration
+        # Trim if audio is longer than output video
         if audio_latent.shape[2] > max_frames:
             audio_latent = audio_latent[:, :, :max_frames, :]
+        # Pad with silence if audio is shorter and padding is requested
+        elif pad_to_duration and audio_latent.shape[2] < max_frames:
+            pad_frames = max_frames - audio_latent.shape[2]
+            padding = torch.zeros(
+                audio_latent.shape[0],
+                audio_latent.shape[1],
+                pad_frames,
+                audio_latent.shape[3],
+                dtype=audio_latent.dtype,
+                device=audio_latent.device,
+            )
+            audio_latent = torch.cat([audio_latent, padding], dim=2)
 
         audio_latent = audio_latent.to(device=self.device, dtype=self.dtype)
         return [AudioConditionByLatent(audio_latent, strength)]
@@ -207,6 +223,8 @@ class TI2VidTwoStagesPipeline:
         input_waveform: torch.Tensor | None = None,
         input_waveform_sample_rate: int | None = None,
         audio_strength: float = 1.0,
+        audio_pad_to_duration: bool = False,
+        use_neutral_audio_context: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -221,6 +239,7 @@ class TI2VidTwoStagesPipeline:
                 num_frames=num_frames,
                 fps=frame_rate,
                 strength=audio_strength,
+                pad_to_duration=audio_pad_to_duration,
             )
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
@@ -236,6 +255,12 @@ class TI2VidTwoStagesPipeline:
         context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
         v_context_p, a_context_p = context_p
         v_context_n, a_context_n = context_n
+
+        # For audio-to-video: use neutral (empty) audio context so generation fully relies on input audio
+        if use_neutral_audio_context:
+            neutral_p, neutral_n = encode_text(text_encoder, prompts=["", negative_prompt])
+            _, a_context_p = neutral_p
+            _, a_context_n = neutral_n
 
         if not skip_cleanup:
             torch.cuda.synchronize()
@@ -266,7 +291,7 @@ class TI2VidTwoStagesPipeline:
                     ),
                     v_context=v_context_p,
                     a_context=a_context_p,
-                    transformer=transformer,  # noqa: F821
+                    transformer=transformer,
                 ),
             )
 
@@ -345,7 +370,7 @@ class TI2VidTwoStagesPipeline:
                 denoise_fn=simple_denoising_func(
                     video_context=v_context_p,
                     audio_context=a_context_p,
-                    transformer=transformer,  # noqa: F821
+                    transformer=transformer,
                 ),
             )
 
