@@ -170,6 +170,10 @@ class TI2VidTwoStagesPipeline:
 
         mel = mel.to(device=enc_device, dtype=enc_dtype)
         with torch.inference_mode():
+            # NOTE: encoder.forward() uses only the mean chunk via _normalize_latents.
+            # The diffusers pipeline samples from the full distribution instead
+            # (DiagonalGaussianDistribution: mean + std * randn). This may improve
+            # audio quality but requires exposing encoder internals. Left as-is for now.
             audio_latent = audio_encoder(mel)
 
         # Safety trim: ensure latent doesn't exceed the exact frame count needed for the video
@@ -225,6 +229,7 @@ class TI2VidTwoStagesPipeline:
         audio_strength: float = 1.0,
         audio_pad_to_duration: bool = False,
         use_neutral_audio_context: bool = False,
+        skip_stage2_audio: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -340,6 +345,9 @@ class TI2VidTwoStagesPipeline:
             audio_conditionings=audio_conditionings,
         )
 
+        # Save stage 1 audio state for skip_stage2_audio
+        stage_1_audio_state = audio_state
+
         if not skip_cleanup:
             torch.cuda.synchronize()
             del transformer
@@ -412,8 +420,8 @@ class TI2VidTwoStagesPipeline:
             device=self.device,
             noise_scale=distilled_sigmas[0],
             initial_video_latent=upscaled_video_latent,
-            initial_audio_latent=audio_state.latent,
-            audio_conditionings=audio_conditionings,
+            initial_audio_latent=None if skip_stage2_audio else audio_state.latent,
+            audio_conditionings=None if skip_stage2_audio else audio_conditionings,
         )
 
         if not skip_cleanup:
@@ -425,6 +433,11 @@ class TI2VidTwoStagesPipeline:
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
         )
+
+        # Restore stage 1 audio state when skipping stage 2 audio processing
+        if skip_stage2_audio:
+            audio_state = stage_1_audio_state
+
         decoded_audio = vae_decode_audio(
             audio_state.latent, self.stage_2_model_ledger.audio_decoder(), self.stage_2_model_ledger.vocoder()
         )
