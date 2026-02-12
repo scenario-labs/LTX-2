@@ -5,8 +5,10 @@ import torch
 from safetensors import safe_open
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
+from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
+from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning import ConditioningItem, VideoConditionByReferenceLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
@@ -30,6 +32,7 @@ from ltx_pipelines.utils.helpers import (
     generate_enhanced_prompt,
     get_device,
     image_conditionings_by_replacing_latent,
+    multi_modal_guider_denoising_func,
     simple_denoising_func,
 )
 from ltx_pipelines.utils.media_io import encode_video, load_video_conditioning
@@ -56,6 +59,7 @@ class ICLoraPipeline:
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device = device,
         fp8transformer: bool = False,
+        distilled_lora: list[LoraPathStrengthAndSDOps] | None = None,
     ):
         self.dtype = torch.bfloat16
         self.stage_1_model_ledger = ModelLedger(
@@ -67,15 +71,20 @@ class ICLoraPipeline:
             loras=loras,
             fp8transformer=fp8transformer,
         )
-        self.stage_2_model_ledger = ModelLedger(
-            dtype=self.dtype,
-            device=device,
-            checkpoint_path=checkpoint_path,
-            spatial_upsampler_path=spatial_upsampler_path,
-            gemma_root_path=gemma_root,
-            loras=[],
-            fp8transformer=fp8transformer,
-        )
+        if distilled_lora is not None:
+            self.stage_2_model_ledger = self.stage_1_model_ledger.with_loras(
+                loras=distilled_lora,
+            )
+        else:
+            self.stage_2_model_ledger = ModelLedger(
+                dtype=self.dtype,
+                device=device,
+                checkpoint_path=checkpoint_path,
+                spatial_upsampler_path=spatial_upsampler_path,
+                gemma_root_path=gemma_root,
+                loras=[],
+                fp8transformer=fp8transformer,
+            )
         self.pipeline_components = PipelineComponents(
             dtype=self.dtype,
             device=device,
@@ -110,8 +119,14 @@ class ICLoraPipeline:
         video_conditioning: list[tuple[str, float]],
         enhance_prompt: bool = False,
         tiling_config: TilingConfig | None = None,
+        negative_prompt: str | None = None,
+        num_inference_steps: int | None = None,
+        video_guider_params: MultiModalGuiderParams | None = None,
+        audio_guider_params: MultiModalGuiderParams | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
+
+        use_cfg = negative_prompt is not None and video_guider_params is not None
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -124,7 +139,13 @@ class ICLoraPipeline:
             prompt = generate_enhanced_prompt(
                 text_encoder, prompt, images[0][0] if len(images) > 0 else None, seed=seed
             )
-        video_context, audio_context = encode_text(text_encoder, prompts=[prompt])[0]
+
+        if use_cfg:
+            context_p, context_n = encode_text(text_encoder, prompts=[prompt, negative_prompt])
+            v_context_p, a_context_p = context_p
+            v_context_n, a_context_n = context_n
+        else:
+            video_context, audio_context = encode_text(text_encoder, prompts=[prompt])[0]
 
         torch.cuda.synchronize()
         del text_encoder
@@ -133,22 +154,51 @@ class ICLoraPipeline:
         # Stage 1: Initial low resolution video generation.
         video_encoder = self.stage_1_model_ledger.video_encoder()
         transformer = self.stage_1_model_ledger.transformer()
-        stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
 
-        def first_stage_denoising_loop(
-            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
-        ) -> tuple[LatentState, LatentState]:
-            return euler_denoising_loop(
-                sigmas=sigmas,
-                video_state=video_state,
-                audio_state=audio_state,
-                stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    transformer=transformer,  # noqa: F821
-                ),
+        if use_cfg:
+            stage_1_sigmas = LTX2Scheduler().execute(steps=num_inference_steps).to(
+                dtype=torch.float32, device=self.device
             )
+
+            def first_stage_denoising_loop(
+                sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
+            ) -> tuple[LatentState, LatentState]:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=multi_modal_guider_denoising_func(
+                        video_guider=MultiModalGuider(
+                            params=video_guider_params,
+                            negative_context=v_context_n,
+                        ),
+                        audio_guider=MultiModalGuider(
+                            params=audio_guider_params,
+                            negative_context=a_context_n,
+                        ),
+                        v_context=v_context_p,
+                        a_context=a_context_p,
+                        transformer=transformer,  # noqa: F821
+                    ),
+                )
+        else:
+            stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
+
+            def first_stage_denoising_loop(
+                sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
+            ) -> tuple[LatentState, LatentState]:
+                return euler_denoising_loop(
+                    sigmas=sigmas,
+                    video_state=video_state,
+                    audio_state=audio_state,
+                    stepper=stepper,
+                    denoise_fn=simple_denoising_func(
+                        video_context=video_context,
+                        audio_context=audio_context,
+                        transformer=transformer,  # noqa: F821
+                    ),
+                )
 
         stage_1_output_shape = VideoPixelShape(
             batch=1,
@@ -194,6 +244,11 @@ class ICLoraPipeline:
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
 
+        # Stage 2 always uses simple_denoising_func (distilled refinement).
+        # Use positive context when in CFG mode.
+        s2_v_context = v_context_p if use_cfg else video_context
+        s2_a_context = a_context_p if use_cfg else audio_context
+
         def second_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
         ) -> tuple[LatentState, LatentState]:
@@ -203,8 +258,8 @@ class ICLoraPipeline:
                 audio_state=audio_state,
                 stepper=stepper,
                 denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
+                    video_context=s2_v_context,
+                    audio_context=s2_a_context,
                     transformer=transformer,  # noqa: F821
                 ),
             )
