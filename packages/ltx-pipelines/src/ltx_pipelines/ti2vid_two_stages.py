@@ -9,6 +9,7 @@ from ltx_core.components.guiders import MultiModalGuider, MultiModalGuiderParams
 from ltx_core.components.noisers import GaussianNoiser
 from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
+from ltx_core.conditioning import VideoConditionByReferenceLatent
 from ltx_core.conditioning.types import AudioConditionByLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
 from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
@@ -35,7 +36,7 @@ from ltx_pipelines.utils.helpers import (
     simple_denoising_func,
     video_conditionings_by_replacing_latent,
 )
-from ltx_pipelines.utils.media_io import encode_video
+from ltx_pipelines.utils.media_io import encode_video, load_video_conditioning
 from ltx_pipelines.utils.types import PipelineComponents
 
 device = get_device()
@@ -61,6 +62,7 @@ class TI2VidTwoStagesPipeline:
     ):
         self.device = device
         self.dtype = torch.bfloat16
+        self.reference_downscale_factor = 1
         self.stage_1_model_ledger = ModelLedger(
             dtype=self.dtype,
             device=device,
@@ -207,6 +209,7 @@ class TI2VidTwoStagesPipeline:
         input_waveform: torch.Tensor | None = None,
         input_waveform_sample_rate: int | None = None,
         audio_strength: float = 1.0,
+        video_conditioning: list[tuple[str, float]] | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
 
@@ -286,6 +289,29 @@ class TI2VidTwoStagesPipeline:
             device=self.device,
             image_crf=image_crf,
         )
+
+        # Add IC-LoRA video conditioning (stage 1 only)
+        if video_conditioning:
+            scale = self.reference_downscale_factor
+            ref_height = stage_1_output_shape.height // scale
+            ref_width = stage_1_output_shape.width // scale
+            for video_path, strength in video_conditioning:
+                video = load_video_conditioning(
+                    video_path=video_path,
+                    height=ref_height,
+                    width=ref_width,
+                    frame_cap=num_frames,
+                    dtype=dtype,
+                    device=self.device,
+                )
+                encoded_video = video_encoder(video)
+                stage_1_conditionings.append(
+                    VideoConditionByReferenceLatent(
+                        latent=encoded_video,
+                        downscale_factor=scale,
+                        strength=strength,
+                    )
+                )
 
         # Add video extension conditioning if provided
         if video_extend_path:
