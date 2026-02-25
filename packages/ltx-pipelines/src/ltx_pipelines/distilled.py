@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -83,8 +83,22 @@ class DistilledPipeline:
         enhance_prompt: bool = False,
         image_crf: float | None = None,
         skip_cleanup: bool = False,
+        callback: Callable[[int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
+
+        # Compute total steps across both stages for combined progress reporting.
+        stage_1_steps = len(DISTILLED_SIGMA_VALUES) - 1
+        stage_2_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+        total_combined_steps = stage_1_steps + stage_2_steps
+
+        def stage_1_callback(step: int, _total: int) -> None:
+            if callback is not None:
+                callback(step, total_combined_steps)
+
+        def stage_2_callback(step: int, _total: int) -> None:
+            if callback is not None:
+                callback(stage_1_steps + step, total_combined_steps)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -107,7 +121,13 @@ class DistilledPipeline:
         transformer = self.model_ledger.transformer()
         stage_1_sigmas = torch.Tensor(DISTILLED_SIGMA_VALUES).to(self.device)
 
-        def denoising_loop(
+        denoise_fn = simple_denoising_func(
+            video_context=video_context,
+            audio_context=audio_context,
+            transformer=transformer,
+        )
+
+        def first_stage_denoising_loop(
             sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
         ) -> tuple[LatentState, LatentState]:
             return euler_denoising_loop(
@@ -115,11 +135,20 @@ class DistilledPipeline:
                 video_state=video_state,
                 audio_state=audio_state,
                 stepper=stepper,
-                denoise_fn=simple_denoising_func(
-                    video_context=video_context,
-                    audio_context=audio_context,
-                    transformer=transformer,  # noqa: F821
-                ),
+                denoise_fn=denoise_fn,
+                callback=stage_1_callback,
+            )
+
+        def second_stage_denoising_loop(
+            sigmas: torch.Tensor, video_state: LatentState, audio_state: LatentState, stepper: DiffusionStepProtocol
+        ) -> tuple[LatentState, LatentState]:
+            return euler_denoising_loop(
+                sigmas=sigmas,
+                video_state=video_state,
+                audio_state=audio_state,
+                stepper=stepper,
+                denoise_fn=denoise_fn,
+                callback=stage_2_callback,
             )
 
         stage_1_output_shape = VideoPixelShape(
@@ -145,7 +174,7 @@ class DistilledPipeline:
             noiser=noiser,
             sigmas=stage_1_sigmas,
             stepper=stepper,
-            denoising_loop_fn=denoising_loop,
+            denoising_loop_fn=first_stage_denoising_loop,
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
@@ -177,7 +206,7 @@ class DistilledPipeline:
             noiser=noiser,
             sigmas=stage_2_sigmas,
             stepper=stepper,
-            denoising_loop_fn=denoising_loop,
+            denoising_loop_fn=second_stage_denoising_loop,
             components=self.pipeline_components,
             dtype=dtype,
             device=self.device,
