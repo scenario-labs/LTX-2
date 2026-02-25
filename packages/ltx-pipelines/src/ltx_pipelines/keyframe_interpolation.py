@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -92,8 +92,22 @@ class KeyframeInterpolationPipeline:
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
         skip_cleanup: bool = False,
+        callback: Callable[[int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         assert_resolution(height=height, width=width, is_two_stage=True)
+
+        # Compute total steps across both stages for combined progress reporting.
+        stage_1_steps = num_inference_steps
+        stage_2_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+        total_combined_steps = stage_1_steps + stage_2_steps
+
+        def stage_1_callback(step: int, _total: int) -> None:
+            if callback is not None:
+                callback(step, total_combined_steps)
+
+        def stage_2_callback(step: int, _total: int) -> None:
+            if callback is not None:
+                callback(stage_1_steps + step, total_combined_steps)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -140,6 +154,7 @@ class KeyframeInterpolationPipeline:
                     a_context=a_context_p,
                     transformer=transformer,  # noqa: F821
                 ),
+                callback=stage_1_callback,
             )
 
         stage_1_output_shape = VideoPixelShape(
@@ -201,6 +216,7 @@ class KeyframeInterpolationPipeline:
                     audio_context=a_context_p,
                     transformer=transformer,  # noqa: F821
                 ),
+                callback=stage_2_callback,
             )
 
         stage_2_output_shape = VideoPixelShape(batch=1, frames=num_frames, width=width, height=height, fps=frame_rate)
