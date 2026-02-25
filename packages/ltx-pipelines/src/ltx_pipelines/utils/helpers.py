@@ -1,5 +1,6 @@
 import gc
 import logging
+from collections.abc import Callable
 from dataclasses import replace
 
 import torch
@@ -179,6 +180,7 @@ def euler_denoising_loop(
     audio_state: LatentState,
     stepper: DiffusionStepProtocol,
     denoise_fn: DenoisingFunc,
+    callback: Callable[[int, int], None] | None = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop over a diffusion schedule.
@@ -206,11 +208,16 @@ def euler_denoising_loop(
         ``denoise_fn(video_state, audio_state, sigmas, step_index)`` and must
         return a tuple ``(denoised_video, denoised_audio)``, where each element
         is a tensor with the same shape as the corresponding latent.
+    callback:
+        An optional callback invoked after each denoising step as
+        ``callback(step_index, total_steps)``. Can be used for progress
+        reporting. If ``None``, no callback is invoked.
     ### Returns
     tuple[LatentState, LatentState]
         A pair ``(video_state, audio_state)`` containing the final video and
         audio latent states after completing the denoising loop.
     """
+    total_steps = len(sigmas) - 1
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
 
@@ -219,6 +226,9 @@ def euler_denoising_loop(
 
         video_state = replace(video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
         audio_state = replace(audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
+
+        if callback is not None:
+            callback(step_idx, total_steps)
 
     return (video_state, audio_state)
 
@@ -230,6 +240,7 @@ def gradient_estimating_euler_denoising_loop(
     stepper: DiffusionStepProtocol,
     denoise_fn: DenoisingFunc,
     ge_gamma: float = 2.0,
+    callback: Callable[[int, int], None] | None = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Perform the joint audio-video denoising loop using gradient-estimation sampling.
@@ -241,6 +252,8 @@ def gradient_estimating_euler_denoising_loop(
     ge_gamma:
         Gradient estimation coefficient controlling the velocity correction term.
         Default is 2.0. Paper: https://openreview.net/pdf?id=o2ND9v0CeK
+    callback:
+        See :func:`euler_denoising_loop` for description.
     sigmas, video_state, audio_state, stepper, denoise_fn:
         See :func:`euler_denoising_loop` for parameter descriptions.
     ### Returns
@@ -261,6 +274,7 @@ def gradient_estimating_euler_denoising_loop(
             denoised_sample = to_denoised(noisy_sample, total_velocity, sigma)
         return current_velocity, denoised_sample
 
+    total_steps = len(sigmas) - 1
     for step_idx, _ in enumerate(tqdm(sigmas[:-1])):
         denoised_video, denoised_audio = denoise_fn(video_state, audio_state, sigmas, step_idx)
 
@@ -268,6 +282,8 @@ def gradient_estimating_euler_denoising_loop(
         denoised_audio = post_process_latent(denoised_audio, audio_state.denoise_mask, audio_state.clean_latent)
 
         if sigmas[step_idx + 1] == 0:
+            if callback is not None:
+                callback(step_idx, total_steps)
             return replace(video_state, latent=denoised_video), replace(audio_state, latent=denoised_audio)
 
         previous_video_velocity, denoised_video = update_velocity_and_sample(
@@ -279,6 +295,9 @@ def gradient_estimating_euler_denoising_loop(
 
         video_state = replace(video_state, latent=stepper.step(video_state.latent, denoised_video, sigmas, step_idx))
         audio_state = replace(audio_state, latent=stepper.step(audio_state.latent, denoised_audio, sigmas, step_idx))
+
+        if callback is not None:
+            callback(step_idx, total_steps)
 
     return (video_state, audio_state)
 
