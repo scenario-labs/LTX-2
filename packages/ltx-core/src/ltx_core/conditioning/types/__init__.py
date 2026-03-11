@@ -1,5 +1,6 @@
 """Conditioning type implementations."""
 
+from ltx_core.conditioning.types.attention_strength_wrapper import ConditioningItemAttentionStrengthWrapper
 from ltx_core.conditioning.types.audio_latent_cond import AudioConditionByLatent
 from ltx_core.conditioning.types.keyframe_cond import VideoConditionByKeyframeIndex
 from ltx_core.conditioning.types.latent_cond import VideoConditionByLatentIndex
@@ -7,6 +8,7 @@ from ltx_core.conditioning.types.reference_video_cond import VideoConditionByRef
 
 __all__ = [
     "AudioConditionByLatent",
+    "ConditioningItemAttentionStrengthWrapper",
     "VideoConditionByKeyframeIndex",
     "VideoConditionByLatentIndex",
     "VideoConditionByReferenceLatent",
