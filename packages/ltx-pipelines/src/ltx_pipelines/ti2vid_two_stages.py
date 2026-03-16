@@ -272,6 +272,22 @@ class TI2VidTwoStagesPipeline:
             dtype=dtype,
             device=self.device,
         )
+
+        # Add video extension conditioning if provided (must be before del video_encoder)
+        if video_extend_path:
+            video_conds = video_conditionings_by_replacing_latent(
+                video_path=video_extend_path,
+                height=stage_1_output_shape.height,
+                width=stage_1_output_shape.width,
+                video_encoder=video_encoder,
+                dtype=dtype,
+                device=self.device,
+                strength=video_extend_strength,
+                context_seconds=video_extend_context_seconds,
+                frame_rate=frame_rate,
+            )
+            stage_1_conditionings.extend(video_conds)
+
         torch.cuda.synchronize()
         del video_encoder
         cleanup_memory()
@@ -302,22 +318,6 @@ class TI2VidTwoStagesPipeline:
                 ),
                 callback=stage_1_callback,
             )
-
-        # Add video extension conditioning if provided
-        if video_extend_path:
-            video_conds = video_conditionings_by_replacing_latent(
-                video_path=video_extend_path,
-                height=stage_1_output_shape.height,
-                width=stage_1_output_shape.width,
-                video_encoder=video_encoder,
-                dtype=dtype,
-                device=self.device,
-                strength=video_extend_strength,
-                context_seconds=video_extend_context_seconds,
-                frame_rate=frame_rate,
-            )
-            stage_1_conditionings.extend(video_conds)
-
 
         video_state, audio_state = denoise_audio_video(
             output_shape=stage_1_output_shape,
