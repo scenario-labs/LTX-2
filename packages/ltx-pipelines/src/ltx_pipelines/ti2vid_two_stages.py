@@ -139,7 +139,7 @@ class TI2VidTwoStagesPipeline:
 
         # Waveform -> Mel spectrogram
         audio_processor = AudioProcessor(
-            sample_rate=target_sr,
+            target_sample_rate=target_sr,
             mel_bins=mel_bins,
             mel_hop_length=mel_hop,
             n_fft=n_fft,
@@ -171,7 +171,7 @@ class TI2VidTwoStagesPipeline:
             ),
             channels=audio_latent.shape[1],
             mel_bins=audio_latent.shape[3],
-            sample_rate=target_sr,
+            target_sample_rate=target_sr,
             hop_length=mel_hop,
             audio_latent_downsample_factor=audio_downsample,
         )
