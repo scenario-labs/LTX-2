@@ -171,7 +171,7 @@ class TI2VidTwoStagesPipeline:
             ),
             channels=audio_latent.shape[1],
             mel_bins=audio_latent.shape[3],
-            target_sample_rate=target_sr,
+            sample_rate=target_sr,
             hop_length=mel_hop,
             audio_latent_downsample_factor=audio_downsample,
         )
