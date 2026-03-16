@@ -144,7 +144,7 @@ class TI2VidTwoStagesPipeline:
             mel_hop_length=mel_hop,
             n_fft=n_fft,
         ).to(waveform.device)
-        mel = audio_processor.waveform_to_mel(waveform, target_sr)
+        mel = audio_processor.waveform_to_mel(Audio(waveform=waveform, sampling_rate=target_sr))
 
         # Mel -> Audio latent via encoder
         audio_params = next(audio_encoder.parameters(), None)
