@@ -432,12 +432,13 @@ class ICLoraPipeline:
 
         # Calculate scaled dimensions for reference video conditioning.
         # IC-LoRAs trained with downscaled reference videos expect the same ratio at inference.
-        # Round to nearest multiple of 32 to ensure VAE patchify compatibility
-        # (the VAE encoder needs spatial dims divisible by 32 for its 2x2x2 patchify step).
         scale = self.reference_downscale_factor
-        _VAE_SPATIAL_ALIGN = 32
-        ref_height = round(height / scale / _VAE_SPATIAL_ALIGN) * _VAE_SPATIAL_ALIGN
-        ref_width = round(width / scale / _VAE_SPATIAL_ALIGN) * _VAE_SPATIAL_ALIGN
+        if scale != 1 and (height % scale != 0 or width % scale != 0):
+            raise ValueError(
+                f"Output dimensions ({height}x{width}) must be divisible by reference_downscale_factor ({scale})"
+            )
+        ref_height = height // scale
+        ref_width = width // scale
 
         for video_path, strength in video_conditioning:
             # Load video at scaled-down resolution (if scale > 1)

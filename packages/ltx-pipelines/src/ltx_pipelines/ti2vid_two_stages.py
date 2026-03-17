@@ -2,7 +2,6 @@ import logging
 from collections.abc import Callable, Iterator
 
 import torch
-import torchaudio
 
 from ltx_core.components.diffusion_steps import EulerDiffusionStep
 from ltx_core.components.guiders import (
@@ -15,7 +14,8 @@ from ltx_core.components.protocols import DiffusionStepProtocol
 from ltx_core.components.schedulers import LTX2Scheduler
 from ltx_core.conditioning.types import AudioConditionByLatent
 from ltx_core.loader import LoraPathStrengthAndSDOps
-from ltx_core.model.audio_vae import AudioProcessor, decode_audio as vae_decode_audio
+from ltx_core.model.audio_vae import decode_audio as vae_decode_audio
+from ltx_core.model.audio_vae import encode_audio as vae_encode_audio
 from ltx_core.model.upsampler import upsample_video
 from ltx_core.model.video_vae import TilingConfig, get_video_chunks_number
 from ltx_core.model.video_vae import decode_video as vae_decode_video
@@ -92,6 +92,11 @@ class TI2VidTwoStagesPipeline:
     ) -> list[AudioConditionByLatent] | None:
         """Convert input waveform to audio conditioning for the diffusion process.
 
+        Uses upstream ``vae_encode_audio`` for the core waveform→mel→latent encoding
+        (handles resampling, mel transform, and VAE encoding internally). This method
+        adds pre-processing (shape normalization, channel matching) and post-processing
+        (trim to video duration, wrap in AudioConditionByLatent with strength).
+
         Args:
             input_waveform: Audio waveform tensor, shape (samples,), (C, samples), or (B, C, samples).
             input_sample_rate: Sample rate of input waveform.
@@ -115,15 +120,9 @@ class TI2VidTwoStagesPipeline:
         elif waveform.ndim != 3:
             raise ValueError(f"input_waveform must be 1D/2D/3D, got shape {tuple(waveform.shape)}")
 
-        # Get audio encoder and extract config
+        # Match channels to what the encoder expects
         audio_encoder = self.stage_1_model_ledger.audio_encoder()
-        target_sr = int(getattr(audio_encoder, "sample_rate", 16000))
         target_channels = int(getattr(audio_encoder, "in_channels", 1))
-        mel_bins = int(getattr(audio_encoder, "mel_bins", 64))
-        mel_hop = int(getattr(audio_encoder, "mel_hop_length", 160))
-        n_fft = int(getattr(audio_encoder, "n_fft", 1024))
-
-        # Match channels
         if waveform.shape[1] != target_channels:
             if waveform.shape[1] == 1 and target_channels > 1:
                 waveform = waveform.repeat(1, target_channels, 1)
@@ -132,32 +131,13 @@ class TI2VidTwoStagesPipeline:
             else:
                 waveform = waveform[:, :target_channels, :]
 
-        # Resample to target sample rate
-        waveform = waveform.to(device="cpu", dtype=torch.float32)
-        if int(input_sample_rate) != target_sr:
-            waveform = torchaudio.functional.resample(waveform, int(input_sample_rate), target_sr)
+        # Encode using upstream vae_encode_audio (handles resampling, mel, VAE)
+        audio = Audio(waveform=waveform.to(dtype=torch.float32), sampling_rate=int(input_sample_rate))
+        audio_latent = vae_encode_audio(audio, audio_encoder)
 
-        # Waveform -> Mel spectrogram
-        audio_processor = AudioProcessor(
-            target_sample_rate=target_sr,
-            mel_bins=mel_bins,
-            mel_hop_length=mel_hop,
-            n_fft=n_fft,
-        ).to(waveform.device)
-        mel = audio_processor.waveform_to_mel(Audio(waveform=waveform, sampling_rate=target_sr))
-
-        # Mel -> Audio latent via encoder
-        audio_params = next(audio_encoder.parameters(), None)
-        enc_device = audio_params.device if audio_params is not None else self.device
-        enc_dtype = audio_params.dtype if audio_params is not None else self.dtype
-
-        mel = mel.to(device=enc_device, dtype=enc_dtype)
-        with torch.inference_mode():
-            audio_latent = audio_encoder(mel)
-
-        # For video extension: DON'T pad to full output duration
-        # Only condition on the input audio portion, let the model generate continuation
-        # If input audio is longer than output video, trim it
+        # Trim to video duration — only condition on input audio, let model generate continuation
+        target_sr = int(getattr(audio_encoder, "sample_rate", 16000))
+        mel_hop = int(getattr(audio_encoder, "mel_hop_length", 160))
         audio_downsample = getattr(
             getattr(audio_encoder, "patchifier", None), "audio_latent_downsample_factor", 4
         )
@@ -176,9 +156,6 @@ class TI2VidTwoStagesPipeline:
             audio_latent_downsample_factor=audio_downsample,
         )
         max_frames = int(target_shape.frames)
-
-        # Only trim if audio is longer than output video - do NOT pad
-        # This way, conditioning only applies to input audio duration
         if audio_latent.shape[2] > max_frames:
             audio_latent = audio_latent[:, :, :max_frames, :]
 
