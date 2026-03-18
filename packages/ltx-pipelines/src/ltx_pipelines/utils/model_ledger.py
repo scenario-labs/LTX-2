@@ -380,7 +380,7 @@ class ModelLedger:
         # With fp8_cast, we want _fuse_delta_with_cast_fp8 (Triton kernel) instead.
         if self.quantization is not None and self.quantization.sd_ops is not None:
             filtered = {k: v for k, v in base_sd.sd.items() if not k.endswith(".weight_scale")}
-            base_sd = StateDict(filtered, base_sd.device, base_sd.size, base_sd.inner_dtypes)
+            base_sd = StateDict(filtered, base_sd.device, base_sd.size, base_sd.dtype)
 
         # Fuse base weights with LoRAs
         # Note: apply_loras() automatically handles FP8 weights via Triton kernel
