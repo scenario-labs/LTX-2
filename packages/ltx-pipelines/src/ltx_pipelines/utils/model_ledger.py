@@ -4,7 +4,7 @@ import torch
 
 from ltx_core.loader import SDOps
 from ltx_core.loader.fuse_loras import apply_loras
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, LoraStateDictWithStrength
+from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, LoraStateDictWithStrength, StateDict
 from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
@@ -372,6 +372,15 @@ class ModelLedger:
             LoraStateDictWithStrength(sd, lora.strength)
             for sd, lora in zip(lora_state_dicts, all_loras, strict=True)
         ]
+
+        # Strip weight_scale keys from base_sd when using fp8_cast quantization.
+        # Pre-quantized fp8 checkpoints include per-tensor scale factors that
+        # route LoRA fusion to _fuse_delta_with_scaled_fp8 (fp8_scaled_mm path),
+        # which expects transposed weights and produces shape mismatches.
+        # With fp8_cast, we want _fuse_delta_with_cast_fp8 (Triton kernel) instead.
+        if self.quantization is not None and self.quantization.sd_ops is not None:
+            filtered = {k: v for k, v in base_sd.sd.items() if not k.endswith(".weight_scale")}
+            base_sd = StateDict(filtered, base_sd.device, base_sd.size, base_sd.inner_dtypes)
 
         # Fuse base weights with LoRAs
         # Note: apply_loras() automatically handles FP8 weights via Triton kernel
