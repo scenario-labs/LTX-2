@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 
 import torch
@@ -214,6 +214,7 @@ class RetakePipeline:
         enhance_prompt: bool = False,
         distilled: bool = False,
         tiling_config: TilingConfig | None = None,
+        callback: Callable[[int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
@@ -373,6 +374,7 @@ class RetakePipeline:
                 audio_state=audio_state,
                 stepper=stepper,
                 denoise_fn=denoise_fn,
+                callback=callback,
             )
 
         # Build noised states with the encoded latents as initial values and
