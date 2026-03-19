@@ -140,6 +140,7 @@ class ICLoraPipeline:
         callback: Callable[[int, int], None] | None = None,
         conditioning_attention_strength: float = 1.0,
         skip_stage_2: bool = False,
+        skip_cleanup: bool = False,
         conditioning_attention_mask: torch.Tensor | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         """
@@ -307,9 +308,10 @@ class ICLoraPipeline:
             device=self.device,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         if skip_stage_2:
             # Skip Stage 2: Decode directly from Stage 1 output at half resolution
@@ -331,8 +333,9 @@ class ICLoraPipeline:
             upsampler=self.stage_2_model_ledger.spatial_upsampler(),
         )
 
-        torch.cuda.synchronize()
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -383,10 +386,11 @@ class ICLoraPipeline:
             initial_audio_latent=audio_state.latent,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        del video_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            del video_encoder
+            cleanup_memory()
 
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator

@@ -215,6 +215,7 @@ class RetakePipeline:
         distilled: bool = False,
         tiling_config: TilingConfig | None = None,
         callback: Callable[[int, int], None] | None = None,
+        skip_cleanup: bool = False,
     ) -> tuple[Iterator[torch.Tensor], torch.Tensor]:
         """Regenerate ``[start_time, end_time]`` of the source video (retake).
         Parameters
@@ -289,8 +290,9 @@ class RetakePipeline:
                 fps=fps,
             )
         ]
-        del video_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            del video_encoder
+            cleanup_memory()
 
         initial_audio_latent: torch.Tensor | None = None
         audio_conditionings: list[ConditioningItem] = []
@@ -319,8 +321,9 @@ class RetakePipeline:
                 )
             ]
 
-        del audio_encoder
-        cleanup_memory()
+        if not skip_cleanup:
+            del audio_encoder
+            cleanup_memory()
 
         prompts_to_encode = [prompt] if distilled else [prompt, negative_prompt]
         contexts = encode_prompts(
@@ -405,9 +408,10 @@ class RetakePipeline:
         audio_state = audio_tools.clear_conditioning(audio_state)
         audio_state = audio_tools.unpatchify(audio_state)
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         decoded_video = vae_decode_video(
             video_state.latent, self.model_ledger.video_decoder(), tiling_config, generator
