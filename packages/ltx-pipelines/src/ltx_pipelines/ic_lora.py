@@ -71,7 +71,6 @@ class ICLoraPipeline:
         gemma_root: str,
         loras: list[LoraPathStrengthAndSDOps],
         device: torch.device = device,
-        fp8transformer: bool = False,
         distilled_lora: list[LoraPathStrengthAndSDOps] | None = None,
         quantization: QuantizationPolicy | None = None,
     ):
@@ -97,7 +96,6 @@ class ICLoraPipeline:
                 spatial_upsampler_path=spatial_upsampler_path,
                 gemma_root_path=gemma_root,
                 loras=[],
-                fp8transformer=fp8transformer,
                 quantization=quantization,
             )
         self.pipeline_components = PipelineComponents(

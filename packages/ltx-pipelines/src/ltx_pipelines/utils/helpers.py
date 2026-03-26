@@ -131,7 +131,6 @@ def image_conditionings_by_replacing_latent(
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
-    image_crf: float | None = None,
 ) -> list[ConditioningItem]:
     conditionings = []
     for img in images:
@@ -162,7 +161,6 @@ def image_conditionings_by_adding_guiding_latent(
     video_encoder: VideoEncoder,
     dtype: torch.dtype,
     device: torch.device,
-    image_crf: float | None = None,
 ) -> list[ConditioningItem]:
     conditionings = []
     for img in images:

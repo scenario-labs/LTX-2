@@ -86,8 +86,6 @@ class ModelLedger:
     registry:
         Optional :class:`Registry` instance for weight caching across builders.
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
-    fp8transformer:
-        If ``True``, builds the transformer with FP8 quantization and upcasting during inference.
     tokenizer_max_length:
         Optional maximum token length for the text encoder tokenizer. If provided,
         overrides the default tokenizer max_length (useful for longer prompts).
@@ -109,7 +107,6 @@ class ModelLedger:
         spatial_upsampler_path: str | None = None,
         loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         registry: Registry | None = None,
-        fp8transformer: bool = False,
         tokenizer_max_length: int | None = None,
         quantization: QuantizationPolicy | None = None,
     ):
@@ -120,7 +117,6 @@ class ModelLedger:
         self.spatial_upsampler_path = spatial_upsampler_path
         self.loras = loras
         self.registry = registry or DummyRegistry()
-        self.fp8transformer = fp8transformer
         self.tokenizer_max_length = tokenizer_max_length
         self.quantization = quantization
         self._cached_components: dict[str, object] = {}
@@ -226,7 +222,6 @@ class ModelLedger:
             spatial_upsampler_path=self.spatial_upsampler_path,
             loras=loras,
             registry=self.registry,
-            fp8transformer=self.fp8transformer,
             tokenizer_max_length=self.tokenizer_max_length,
             quantization=self.quantization,
         )
@@ -396,8 +391,7 @@ class ModelLedger:
 
     def _build_transformer(self) -> X0Model:
         """Internal method to build a new transformer instance."""
-        quantization = QuantizationPolicy.fp8_cast() if self.fp8transformer else self.quantization
-        if quantization is None:
+        if self.quantization is None:
             return (
                 X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))
                 .to(self.device)
@@ -405,14 +399,14 @@ class ModelLedger:
             )
         else:
             sd_ops = self.transformer_builder.model_sd_ops
-            if quantization.sd_ops is not None:
+            if self.quantization.sd_ops is not None:
                 sd_ops = SDOps(
-                    name=f"sd_ops_chain_{sd_ops.name}+{quantization.sd_ops.name}",
-                    mapping=(*sd_ops.mapping, *quantization.sd_ops.mapping),
+                    name=f"sd_ops_chain_{sd_ops.name}+{self.quantization.sd_ops.name}",
+                    mapping=(*sd_ops.mapping, *self.quantization.sd_ops.mapping),
                 )
             builder = replace(
                 self.transformer_builder,
-                module_ops=(*self.transformer_builder.module_ops, *quantization.module_ops),
+                module_ops=(*self.transformer_builder.module_ops, *self.quantization.module_ops),
                 model_sd_ops=sd_ops,
             )
             return X0Model(builder.build(device=self._target_device())).to(self.device).eval()
