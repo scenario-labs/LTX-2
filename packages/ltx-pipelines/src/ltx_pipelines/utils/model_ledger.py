@@ -2,8 +2,9 @@ from dataclasses import replace
 
 import torch
 
+from ltx_core.loader import SDOps
 from ltx_core.loader.fuse_loras import apply_loras
-from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, LoraStateDictWithStrength
+from ltx_core.loader.primitives import LoraPathStrengthAndSDOps, LoraStateDictWithStrength, StateDict
 from ltx_core.loader.registry import DummyRegistry, Registry
 from ltx_core.loader.single_gpu_model_builder import SingleGPUModelBuilder as Builder
 from ltx_core.model.audio_vae import (
@@ -19,8 +20,6 @@ from ltx_core.model.audio_vae import (
 )
 from ltx_core.model.transformer import (
     LTXV_MODEL_COMFY_RENAMING_MAP,
-    LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
-    UPCAST_DURING_INFERENCE,
     LTXModelConfigurator,
     X0Model,
 )
@@ -33,13 +32,17 @@ from ltx_core.model.video_vae import (
     VideoEncoder,
     VideoEncoderConfigurator,
 )
+from ltx_core.quantization import QuantizationPolicy
 from ltx_core.text_encoders.gemma import (
-    AV_GEMMA_TEXT_ENCODER_KEY_OPS,
-    AVGemmaTextEncoderModel,
-    AVGemmaTextEncoderModelConfigurator,
+    EMBEDDINGS_PROCESSOR_KEY_OPS,
+    GEMMA_LLM_KEY_OPS,
+    GEMMA_MODEL_OPS,
+    EmbeddingsProcessor,
+    EmbeddingsProcessorConfigurator,
+    GemmaTextEncoder,
+    GemmaTextEncoderConfigurator,
     module_ops_from_gemma_root,
 )
-from ltx_core.text_encoders.gemma.encoders.av_encoder import GEMMA_MODEL_OPS
 from ltx_core.utils import find_matching_file
 
 
@@ -78,19 +81,21 @@ class ModelLedger:
         :meth:`spatial_upsampler` method becomes available; otherwise calling it raises
         a :class:`ValueError`.
     loras:
-        Optional collection of LoRA configurations (paths, strengths, and key operations)
-        that are applied on top of the base transformer weights when building the model.
+        Tuple of LoRA configurations (path, strength, sd_ops) applied on top of the base
+        transformer weights. Use ``()`` for none.
     registry:
         Optional :class:`Registry` instance for weight caching across builders.
         Defaults to :class:`DummyRegistry` which performs no cross-builder caching.
-    fp8transformer:
-        If ``True``, builds the transformer with FP8 quantization and upcasting during inference.
     tokenizer_max_length:
         Optional maximum token length for the text encoder tokenizer. If provided,
         overrides the default tokenizer max_length (useful for longer prompts).
+    quantization:
+        Optional :class:`QuantizationPolicy` controlling how transformer weights
+        are stored and how matmul is executed. Defaults to None, which means no quantization.
     ### Creating Variants
-    Use :meth:`with_loras` to create a new ``ModelLedger`` instance that includes
-    additional LoRA configurations while sharing the same registry for weight caching.
+    Use :meth:`with_additional_loras` to create a new ``ModelLedger`` instance that
+    includes additional LoRA configurations or :meth:`with_loras` to replace existing
+    lora configurations while sharing the same registry for weight caching.
     """
 
     def __init__(
@@ -100,20 +105,20 @@ class ModelLedger:
         checkpoint_path: str | None = None,
         gemma_root_path: str | None = None,
         spatial_upsampler_path: str | None = None,
-        loras: LoraPathStrengthAndSDOps | None = None,
+        loras: tuple[LoraPathStrengthAndSDOps, ...] = (),
         registry: Registry | None = None,
-        fp8transformer: bool = False,
         tokenizer_max_length: int | None = None,
+        quantization: QuantizationPolicy | None = None,
     ):
         self.dtype = dtype
         self.device = device
         self.checkpoint_path = checkpoint_path
         self.gemma_root_path = gemma_root_path
         self.spatial_upsampler_path = spatial_upsampler_path
-        self.loras = loras or ()
+        self.loras = loras
         self.registry = registry or DummyRegistry()
-        self.fp8transformer = fp8transformer
         self.tokenizer_max_length = tokenizer_max_length
+        self.quantization = quantization
         self._cached_components: dict[str, object] = {}
         self.build_model_builders()
 
@@ -141,6 +146,13 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            self.audio_encoder_builder = Builder[AudioEncoder](
+                model_path=self.checkpoint_path,
+                model_class_configurator=AudioEncoderConfigurator,
+                model_sd_ops=AUDIO_VAE_ENCODER_COMFY_KEYS_FILTER,
+                registry=self.registry,
+            )
+
             self.audio_decoder_builder = Builder(
                 model_path=self.checkpoint_path,
                 model_class_configurator=AudioDecoderConfigurator,
@@ -162,15 +174,23 @@ class ModelLedger:
                 registry=self.registry,
             )
 
+            # Embeddings processor only needs the LTX checkpoint (no Gemma weights)
+            self.embeddings_processor_builder = Builder(
+                model_path=self.checkpoint_path,
+                model_class_configurator=EmbeddingsProcessorConfigurator,
+                model_sd_ops=EMBEDDINGS_PROCESSOR_KEY_OPS,
+                registry=self.registry,
+            )
+
             if self.gemma_root_path is not None:
                 module_ops = module_ops_from_gemma_root(self.gemma_root_path)
                 model_folder = find_matching_file(self.gemma_root_path, "model*.safetensors").parent
                 weight_paths = [str(p) for p in model_folder.rglob("*.safetensors")]
 
                 self.text_encoder_builder = Builder(
-                    model_path=(str(self.checkpoint_path), *weight_paths),
-                    model_class_configurator=AVGemmaTextEncoderModelConfigurator,
-                    model_sd_ops=AV_GEMMA_TEXT_ENCODER_KEY_OPS,
+                    model_path=tuple(weight_paths),
+                    model_class_configurator=GemmaTextEncoderConfigurator,
+                    model_sd_ops=GEMMA_LLM_KEY_OPS,
                     registry=self.registry,
                     module_ops=(GEMMA_MODEL_OPS, *module_ops),
                 )
@@ -188,17 +208,22 @@ class ModelLedger:
         else:
             return torch.device("cpu")
 
-    def with_loras(self, loras: LoraPathStrengthAndSDOps) -> "ModelLedger":
+    def with_additional_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "ModelLedger":
+        """Add new lora configurations to the existing ones."""
+        return self.with_loras((*self.loras, *loras))
+
+    def with_loras(self, loras: tuple[LoraPathStrengthAndSDOps, ...]) -> "ModelLedger":
+        """Replace existing lora configurations with new ones."""
         return ModelLedger(
             dtype=self.dtype,
             device=self.device,
             checkpoint_path=self.checkpoint_path,
             gemma_root_path=self.gemma_root_path,
             spatial_upsampler_path=self.spatial_upsampler_path,
-            loras=(*self.loras, *loras),
+            loras=loras,
             registry=self.registry,
-            fp8transformer=self.fp8transformer,
             tokenizer_max_length=self.tokenizer_max_length,
+            quantization=self.quantization,
         )
 
     def cache_components(
@@ -343,6 +368,15 @@ class ModelLedger:
             for sd, lora in zip(lora_state_dicts, all_loras, strict=True)
         ]
 
+        # Strip weight_scale keys from base_sd when using fp8_cast quantization.
+        # Pre-quantized fp8 checkpoints include per-tensor scale factors that
+        # route LoRA fusion to _fuse_delta_with_scaled_fp8 (fp8_scaled_mm path),
+        # which expects transposed weights and produces shape mismatches.
+        # With fp8_cast, we want _fuse_delta_with_cast_fp8 (Triton kernel) instead.
+        if self.quantization is not None and self.quantization.sd_ops is not None:
+            filtered = {k: v for k, v in base_sd.sd.items() if not k.endswith(".weight_scale")}
+            base_sd = StateDict(filtered, base_sd.device, base_sd.size, base_sd.dtype)
+
         # Fuse base weights with LoRAs
         # Note: apply_loras() automatically handles FP8 weights via Triton kernel
         fused_sd = apply_loras(
@@ -357,19 +391,25 @@ class ModelLedger:
 
     def _build_transformer(self) -> X0Model:
         """Internal method to build a new transformer instance."""
-        if self.fp8transformer:
-            fp8_builder = replace(
-                self.transformer_builder,
-                module_ops=(UPCAST_DURING_INFERENCE,),
-                model_sd_ops=LTXV_MODEL_COMFY_RENAMING_WITH_TRANSFORMER_LINEAR_DOWNCAST_MAP,
+        if self.quantization is None:
+            return (
+                X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype))
+                .to(self.device)
+                .eval()
             )
-            model = X0Model(fp8_builder.build(device=self._target_device())).to(self.device)
         else:
-            model = X0Model(self.transformer_builder.build(device=self._target_device(), dtype=self.dtype)).to(
-                self.device
+            sd_ops = self.transformer_builder.model_sd_ops
+            if self.quantization.sd_ops is not None:
+                sd_ops = SDOps(
+                    name=f"sd_ops_chain_{sd_ops.name}+{self.quantization.sd_ops.name}",
+                    mapping=(*sd_ops.mapping, *self.quantization.sd_ops.mapping),
+                )
+            builder = replace(
+                self.transformer_builder,
+                module_ops=(*self.transformer_builder.module_ops, *self.quantization.module_ops),
+                model_sd_ops=sd_ops,
             )
-        model.eval()
-        return model
+            return X0Model(builder.build(device=self._target_device())).to(self.device).eval()
 
     def _build_video_decoder(self) -> VideoDecoder:
         """Internal method to build a new video decoder instance."""
@@ -383,12 +423,10 @@ class ModelLedger:
         model.eval()
         return model
 
-    def _build_text_encoder(self) -> AVGemmaTextEncoderModel:
+    def _build_text_encoder(self) -> GemmaTextEncoder:
         """Internal method to build a new text encoder instance."""
         encoder = self.text_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device)
         encoder.eval()
-        if self.tokenizer_max_length is not None:
-            encoder.tokenizer.max_length = self.tokenizer_max_length
         return encoder
 
     def _build_audio_decoder(self) -> AudioDecoder:
@@ -442,7 +480,7 @@ class ModelLedger:
             return self._cached_components["video_encoder"]
         return self._build_video_encoder()
 
-    def text_encoder(self) -> AVGemmaTextEncoderModel:
+    def text_encoder(self) -> GemmaTextEncoder:
         if not hasattr(self, "text_encoder_builder"):
             raise ValueError(
                 "Text encoder not initialized. Please provide a checkpoint path and gemma root path to the "
@@ -451,6 +489,26 @@ class ModelLedger:
         if "text_encoder" in self._cached_components:
             return self._cached_components["text_encoder"]
         return self._build_text_encoder()
+
+    def gemma_embeddings_processor(self) -> EmbeddingsProcessor:
+        if not hasattr(self, "embeddings_processor_builder"):
+            raise ValueError(
+                "Embeddings processor not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+
+        return (
+            self.embeddings_processor_builder.build(device=self._target_device(), dtype=self.dtype)
+            .to(self.device)
+            .eval()
+        )
+
+    def audio_encoder(self) -> AudioEncoder:
+        if not hasattr(self, "audio_encoder_builder"):
+            raise ValueError(
+                "Audio encoder not initialized. Please provide a checkpoint path to the ModelLedger constructor."
+            )
+
+        return self.audio_encoder_builder.build(device=self._target_device(), dtype=self.dtype).to(self.device).eval()
 
     def audio_decoder(self) -> AudioDecoder:
         if not hasattr(self, "audio_decoder_builder"):
