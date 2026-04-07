@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -94,8 +94,23 @@ class A2VidPipelineTwoStage:
         audio_max_duration: float | None = None,
         tiling_config: TilingConfig | None = None,
         enhance_prompt: bool = False,
+        skip_cleanup: bool = False,
+        callback: Callable[[int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=True)
+
+        # Compute total steps across both stages for combined progress reporting.
+        stage_1_steps = num_inference_steps
+        stage_2_steps = len(STAGE_2_DISTILLED_SIGMA_VALUES) - 1
+        total_combined_steps = stage_1_steps + stage_2_steps
+
+        def stage_1_callback(step: int, _total: int) -> None:
+            if callback is not None:
+                callback(step, total_combined_steps)
+
+        def stage_2_callback(step: int, _total: int) -> None:
+            if callback is not None:
+                callback(stage_1_steps + step, total_combined_steps)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
         noiser = GaussianNoiser(generator=generator)
@@ -162,6 +177,7 @@ class A2VidPipelineTwoStage:
                     a_context=a_context_p,
                     transformer=transformer,  # noqa: F821
                 ),
+                callback=stage_1_callback,
             )
 
         video_state = denoise_video_only(
@@ -177,9 +193,10 @@ class A2VidPipelineTwoStage:
             initial_audio_latent=encoded_audio_latent,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         # Stage 2: Upsample and refine the video at higher resolution with distilled LoRA.
         video_encoder = self.stage_1_model_ledger.video_encoder()
@@ -199,8 +216,9 @@ class A2VidPipelineTwoStage:
             device=self.device,
         )
         del video_encoder
-        torch.cuda.synchronize()
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            cleanup_memory()
 
         transformer = self.stage_2_model_ledger.transformer()
         distilled_sigmas = torch.Tensor(STAGE_2_DISTILLED_SIGMA_VALUES).to(self.device)
@@ -218,6 +236,7 @@ class A2VidPipelineTwoStage:
                     audio_context=a_context_p,
                     transformer=transformer,  # noqa: F821
                 ),
+                callback=stage_2_callback,
             )
 
         video_state = denoise_video_only(
@@ -235,9 +254,10 @@ class A2VidPipelineTwoStage:
             initial_audio_latent=encoded_audio_latent,
         )
 
-        torch.cuda.synchronize()
-        del transformer
-        cleanup_memory()
+        if not skip_cleanup:
+            torch.cuda.synchronize()
+            del transformer
+            cleanup_memory()
 
         decoded_video = vae_decode_video(
             video_state.latent, self.stage_2_model_ledger.video_decoder(), tiling_config, generator
