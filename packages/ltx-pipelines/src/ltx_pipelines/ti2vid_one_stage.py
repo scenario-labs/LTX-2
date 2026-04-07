@@ -1,5 +1,5 @@
 import logging
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 
 import torch
 
@@ -83,6 +83,7 @@ class TI2VidOneStagePipeline:
         images: list[ImageConditioningInput],
         enhance_prompt: bool = False,
         skip_cleanup: bool = False,
+        callback: Callable[[int, int], None] | None = None,
     ) -> tuple[Iterator[torch.Tensor], Audio]:
         assert_resolution(height=height, width=width, is_two_stage=False)
 
@@ -144,6 +145,7 @@ class TI2VidOneStagePipeline:
                     a_context=a_context_p,
                     transformer=transformer,  # noqa: F821
                 ),
+                callback=callback,
             )
 
         video_state, audio_state = denoise_audio_video(

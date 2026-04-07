@@ -199,6 +199,7 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915
     new_noise_fn: Callable[[torch.Tensor, torch.Generator], torch.Tensor] = _get_new_noise,
     model_dtype: torch.dtype = torch.bfloat16,
     legacy_mode: bool = True,
+    callback: Callable[[int, int], None] | None = None,
 ) -> tuple[LatentState, LatentState]:
     """
     Joint audio-video denoising loop using the res_2s second-order sampler.
@@ -369,6 +370,9 @@ def res2s_audio_video_denoising_loop(  # noqa: PLR0913,PLR0915
         # Update states
         video_state = replace(video_state, latent=x_next_video.to(model_dtype))
         audio_state = replace(audio_state, latent=x_next_audio.to(model_dtype))
+
+        if callback is not None:
+            callback(step_idx, n_full_steps)
 
     # Final step if we need to fully remove the noise
     if sigmas[-1] == 0:
