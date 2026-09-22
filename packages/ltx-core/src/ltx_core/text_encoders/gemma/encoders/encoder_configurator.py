@@ -105,9 +105,12 @@ GEMMA_LLM_KEY_OPS = (
     # 1. Map language model layers (note the double .model prefix)
     .with_matching(prefix="language_model.model.")
     .with_replacement("language_model.model.", "model.model.language_model.")
-    # 2. Map the Vision Tower
+    # 2. Map the Vision Tower. The checkpoint key is vision_tower.vision_model.encoder.X; on the
+    #    loaded model it lands at model.model.vision_tower.encoder.X. transformers 5.8 flattened
+    #    SiglipVisionModel -- the inner SiglipVisionTransformer (previously at .vision_model) was
+    #    hoisted up, so the vision_model. segment is gone.
     .with_matching(prefix="vision_tower.")
-    .with_replacement("vision_tower.", "model.model.vision_tower.")
+    .with_replacement("vision_tower.vision_model.", "model.model.vision_tower.")
     # 3. Map the Multi-Modal Projector
     .with_matching(prefix="multi_modal_projector.")
     .with_replacement("multi_modal_projector.", "model.model.multi_modal_projector.")
@@ -152,24 +155,42 @@ VIDEO_ONLY_EMBEDDINGS_PROCESSOR_KEY_OPS = (
 )
 
 
+def _populate_rotary(l_model: torch.nn.Module, config: Gemma3Config) -> None:
+    """transformers >= 5 layout: a single rotary_emb holding per-layer-type buffers.
+    Gemma 3 declares two layer types, "sliding_attention" (local RoPE, rope_theta =
+    rope_local_base_freq) and "full_attention" (global RoPE, linear scaling). Each type owns a
+    ``<layer_type>_inv_freq`` buffer that ``Gemma3RotaryEmbedding.forward`` reads by name, so the
+    buffers are recomputed per type from the config here instead of on the 4.x ``rotary_emb`` /
+    ``rotary_emb_local`` pair.
+    """
+    rope_emb = l_model.rotary_emb
+    for layer_type in dict.fromkeys(config.layer_types):
+        rope_params = config.rope_parameters[layer_type]
+        if rope_params is None:
+            continue
+        rope_type = rope_params["rope_type"]
+        if rope_type == "default":
+            inv_freq, attn_scaling = rope_emb.compute_default_rope_parameters(config, layer_type=layer_type)
+        else:
+            inv_freq, attn_scaling = ROPE_INIT_FUNCTIONS[rope_type](config, layer_type=layer_type)
+        rope_emb.register_buffer(f"{layer_type}_inv_freq", inv_freq, persistent=False)
+        rope_emb.register_buffer(f"{layer_type}_original_inv_freq", inv_freq.clone(), persistent=False)
+        setattr(rope_emb, f"{layer_type}_attention_scaling", attn_scaling)
+
+
 def create_and_populate(module: GemmaTextEncoder) -> GemmaTextEncoder:
     model = module.model
-    v_model = model.model.vision_tower.vision_model
+    v_tower = model.model.vision_tower
     l_model = model.model.language_model
-
     config = model.config.text_config
-    dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
-    base = config.rope_local_base_freq
-    local_rope_freqs = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).to(dtype=torch.float) / dim))
-    inv_freqs, _ = ROPE_INIT_FUNCTIONS[config.rope_scaling["rope_type"]](config)
 
-    positions_length = len(v_model.embeddings.position_ids[0])
+    _populate_rotary(l_model, config)
+
+    positions_length = len(v_tower.embeddings.position_ids[0])
     position_ids = torch.arange(positions_length, dtype=torch.long, device="cpu").unsqueeze(0)
-    v_model.embeddings.register_buffer("position_ids", position_ids)
-    embed_scale = torch.tensor(model.config.text_config.hidden_size**0.5, device="cpu")
-    l_model.embed_tokens.register_buffer("embed_scale", embed_scale)
-    l_model.rotary_emb_local.register_buffer("inv_freq", local_rope_freqs)
-    l_model.rotary_emb.register_buffer("inv_freq", inv_freqs)
+    v_tower.embeddings.register_buffer("position_ids", position_ids, persistent=False)
+    embed_scale = torch.tensor(config.hidden_size**0.5, device="cpu")
+    l_model.embed_tokens.register_buffer("embed_scale", embed_scale, persistent=False)
 
     return module
 
