@@ -140,19 +140,20 @@ def _cat_with_padding(
     padding_length: int,
     value: int | float,
 ) -> torch.Tensor:
-    """Concatenate a tensor with a padding tensor of the given value."""
-    return torch.cat(
-        [
-            tensor,
-            torch.full(
-                (1, padding_length),
-                value,
-                dtype=tensor.dtype,
-                device=tensor.device,
-            ),
-        ],
-        dim=1,
+    """Left-pad a tensor (prepend the padding) with the given value.
+    Decoder-only LLMs must be LEFT-padded for generation: with right-padding the trailing
+    pad positions become the sequence end, so generate() continues from a pad position
+    instead of the real last token. Left-padding keeps the real last token at the end
+    while still aligning the sequence length to a multiple of 8.
+    See https://huggingface.co/docs/transformers/en/llm_tutorial#padding-side
+    """
+    pad = torch.full(
+        (1, padding_length),
+        value,
+        dtype=tensor.dtype,
+        device=tensor.device,
     )
+    return torch.cat([pad, tensor], dim=1)
 
 
 def _pad_inputs_for_attention_alignment(
