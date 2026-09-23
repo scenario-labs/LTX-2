@@ -7,9 +7,14 @@ requires-python = ">=3.10"
 dependencies = [
     "torch~=2.7",
     "torchaudio",
+    # transformers >= 5 image processors (AutoImageProcessor, used by the Gemma 3 prompt-enhance
+    # processor) import torchvision; without it Gemma3Processor construction fails at load time.
+    "torchvision",
     "einops",
     "numpy",
-    "transformers>=4.52",
+    # transformers >= 5.8: Gemma 3 rope buffers are per layer type on a single rotary_emb and
+    # SiglipVisionModel is flat (no .vision_model) -- see text_encoders/gemma/encoders.
+    "transformers>=5.8.0",
     "safetensors",
     "accelerate",
     "scipy>=1.14",
